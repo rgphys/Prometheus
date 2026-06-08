@@ -17,7 +17,7 @@ import numpy as np
 from numba import njit, prange
 from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.ndimage import gaussian_filter as gauss
-from scipy.special import erf, voigt_profile
+from scipy.special import erf, lambertw, voigt_profile
 
 from . import constants as const
 from . import geometryHandler as geom
@@ -29,7 +29,7 @@ lineListPath: str = os.path.dirname(os.path.dirname(
 LINE_LIST = np.loadtxt(lineListPath, dtype=str,
                               usecols=(0, 1, 2, 3, 4), skiprows=1)
 molecularLookupPath: str = os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))) + '/molecularResources/'
+    os.path.abspath(__file__))) + '/Resources/molecularResources/'
 
 @njit(parallel=True, fastmath=True)
 def n_interp_log(x_targets, x_grid, y_grid_log, offset):
@@ -117,6 +117,15 @@ class CollisionalAtmosphere:
         """
         constituent = MolecularConstituent(speciesName, chi)
         self.constituents.append(constituent)
+
+    def addScatteringConstituent(self, scattererType: str, paramsDict: dict) -> None:
+        """Adds a continuum scattering/aerosol constituent to the atmosphere.
+
+        Args:
+            scattererType (str): One of `SCATTERER_TYPES`.
+            paramsDict (dict): Parameter dictionary from the setup file.
+        """
+        self.constituents.append(makeScatteringConstituent(scattererType, paramsDict))
 
 
 class BarometricAtmosphere(CollisionalAtmosphere):
@@ -286,6 +295,21 @@ class EvaporativeExosphere:
         constituent = MolecularConstituent(speciesName, 1.0)
         self.constituents: List[MolecularConstituent] = [constituent]
         self.T: float = T
+
+    def addScatteringConstituent(self, scattererType: str, paramsDict: dict) -> None:
+        """Adds a continuum scattering/aerosol constituent to the exosphere.
+
+        Unlike the atomic/molecular constituents of an evaporative exosphere
+        (which replace the single absorber), scattering constituents are
+        appended so they can coexist with another absorber.
+
+        Args:
+            scattererType (str): One of `SCATTERER_TYPES`.
+            paramsDict (dict): Parameter dictionary from the setup file.
+        """
+        if not hasattr(self, 'constituents') or self.constituents is None:
+            self.constituents = []
+        self.constituents.append(makeScatteringConstituent(scattererType, paramsDict))
 
 
 class PowerLawExosphere(EvaporativeExosphere):
@@ -578,27 +602,256 @@ class SerpensExosphere(EvaporativeExosphere):
         print('Sum over all particles outside of the planetary disk but inside the stellar disk:', np.sum(
             n_histogram[SEL]) * cellVolume)
         n_function = RegularGridInterpolator(
-            (xPoints, yPoints, zPoints), n_histogram)
+            (xPoints, yPoints, zPoints), n_histogram,
+            bounds_error=False, fill_value=0.0)
         self.InterpolatedDensity: Callable[[
             np.ndarray], np.ndarray] = n_function
 
-    def calculateNumberDensity(self, x: np.ndarray, phi: float, rho: float, orbphase: float) -> np.ndarray:
+    def calculateNumberDensity(self, x: np.ndarray, phi, rho, orbphase) -> np.ndarray:
         """Calculates number density using the pre-computed interpolation function.
 
+        Fully vectorized over a batch of chords: ``phi`` and ``rho`` may be
+        scalars (one chord) or 1-D arrays of length ``n_chords``.  This mirrors
+        the batched contract of the other density models so the SERPENS
+        exosphere works with the vectorized ``getLOSopticalDepth_Batch`` path.
+
         Args:
-            x (np.ndarray): Array of coordinates along the line of sight (cm).
-            phi (float): Azimuthal angle on the sky plane (radians).
-            rho (float): Projected radial distance from star's center (cm).
-            orbphase (float): Planet's orbital phase (radians).
+            x (np.ndarray): Coordinates along the line of sight (cm), shape (n_x,).
+            phi (float | np.ndarray): Azimuthal sky-plane angle(s) (radians).
+            rho (float | np.ndarray): Projected radial distance(s) from the star
+                centre (cm).
+            orbphase (float): Planet's orbital phase (radians); unused here as the
+                SERPENS density field is static in the transit frame.
 
         Returns:
-            np.ndarray: The number density at each x coordinate (cm^-3).
+            np.ndarray: Number density (cm^-3).  Shape ``(n_x,)`` for scalar
+            ``phi``/``rho``, or ``(n_chords, n_x)`` for batched input.
         """
-        y, z = geom.Grid.getCartesianFromCylinder(phi, rho)
-        coordArray = np.array(
-            [x, np.repeat(y, np.size(x)), np.repeat(z, np.size(x))]).T
-        n = self.InterpolatedDensity(coordArray)
-        return n
+        scalar_in = np.ndim(phi) == 0 and np.ndim(rho) == 0
+        x = np.atleast_1d(x)
+        phi_arr = np.atleast_1d(phi)
+        rho_arr = np.atleast_1d(rho)
+        y, z = geom.Grid.getCartesianFromCylinder(phi_arr, rho_arr)   # (n_chords,)
+        n_chords, n_x = phi_arr.size, x.size
+        X = np.broadcast_to(x[None, :], (n_chords, n_x))
+        Y = np.broadcast_to(np.atleast_1d(y)[:, None], (n_chords, n_x))
+        Z = np.broadcast_to(np.atleast_1d(z)[:, None], (n_chords, n_x))
+        coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        n = self.InterpolatedDensity(coords).reshape(n_chords, n_x)
+        return n[0] if scalar_in else n
+
+
+class RadialWindExosphere(EvaporativeExosphere):
+    """Radially expanding planetary wind with a beta-law velocity profile.
+
+    The number density follows from mass continuity:
+        n(r) = Mdot / (4π r² v(r) μ_particle)
+    with the beta-law velocity profile:
+        v(r) = v_terminal * max(1 − r_inner/r, 0)^beta.
+
+    Two velocity laws are supported, selected by ``wind_model``:
+
+    * ``'beta'`` (default) — a parametrized (beta-law) wind.  Setting beta ≈ 1
+      and v_terminal near the local sound speed gives a first-order
+      approximation to a thermally driven Parker wind.
+    * ``'parker'`` — the exact **isothermal Parker wind** transonic solution,
+      obtained in closed form via the Lambert-W function (see
+      :meth:`_wind_velocity_parker`).  This has no free ``beta``/``v_terminal``/
+      ``v_base`` knobs; the profile is fixed by the wind temperature ``T`` and
+      the planet mass, with ``Mdot`` setting only the density normalization.
+
+      A trace heavy species (e.g. Na) does not drive its own transonic wind —
+      its sonic point lies far outside the line-forming region — but is instead
+      *advected* by the bulk (light, H/He) outflow.  Pass ``wind_mu`` to set the
+      mean particle mass that fixes the Parker **dynamics** (sound speed, sonic
+      radius, hence v(r)) to that of the bulk gas, while ``mu`` continues to set
+      the **density normalization** n = Mdot / (4π r² v μ) for the tracer.  When
+      ``wind_mu`` is omitted the dynamics use ``mu`` (a self-driven wind).
+
+    A *modified* beta velocity law is used (for ``wind_model='beta'``) so the
+    outflow is launched with a
+    finite base speed ``v_base`` at ``r_inner``:
+
+        v(r) = v_base + (v_terminal − v_base) · max(1 − r_inner/r, 0)^beta.
+
+    The finite base velocity represents the (subsonic, ≈ sound-speed) wind
+    launch speed of a transonic outflow.  Physically it sets the wind base
+    density ρ_base = Ṁ / (4π r_inner² v_base μ) and removes the unphysical
+    density divergence that a pure beta law (v → 0 at r_inner) produces through
+    mass continuity — no arbitrary post-hoc density/velocity floor is required.
+
+    When Doppler orbital motion is enabled, :meth:`calculateLOSVelocity` is
+    called automatically by :meth:`Atmosphere.getLOSopticalDepth_Batch` to
+    apply a position-dependent (per-x) Doppler shift to atomic absorbers.
+
+    Attributes:
+        Mdot (float): Mass loss rate [g/s].
+        mu (float): Mean particle mass [g].
+        v_terminal (float): Terminal wind speed [cm/s].
+        beta (float): Beta-law exponent (default 1.0).
+        r_inner (float): Inner wind boundary [cm]; defaults to planet.R.
+        r_outer (float or None): Optional outer cutoff [cm].
+        v_base (float): Wind launch speed at r_inner [cm/s].  Defaults to
+            v_terminal × 1e-3 (a small but finite subsonic base speed); set it
+            to the sound speed at the base for a transonic, Parker-like wind.
+        planet (Any): Host planet object.
+    """
+
+    def __init__(self, Mdot: float, mu: float, v_terminal: float = None,
+                 beta: float = 1.0, r_inner: float = None,
+                 r_outer: float = None, v_base: float = None,
+                 wind_model: str = 'beta', T: float = None,
+                 planet: Any = None, wind_mu: float = None):
+        super().__init__(1.0)  # N placeholder; density set by mass continuity
+        self.Mdot: float = Mdot
+        self.mu: float = mu
+        self.beta: float = beta
+        self.planet: Any = planet
+        self.r_inner: float = r_inner if r_inner is not None else planet.R
+        self.r_outer: float = r_outer
+        self.wind_model: str = wind_model
+
+        if wind_model == 'parker':
+            if T is None:
+                raise ValueError("wind_model='parker' requires a wind "
+                                 "temperature T [K].")
+            if planet is None:
+                raise ValueError("wind_model='parker' requires a planet "
+                                 "(for the gravitational sonic point).")
+            self.T: float = T
+            # Parker dynamics are set by the bulk escaping gas mean mass
+            # ``wind_mu`` (defaults to ``mu`` for a self-driven wind); a trace
+            # species keeps its own ``mu`` for the density normalization only.
+            self.wind_mu: float = wind_mu if wind_mu is not None else mu
+            # Isothermal sound speed and sonic-point radius (bulk dynamics).
+            self.c_s: float = np.sqrt(const.k_B * T / self.wind_mu)
+            self.r_c: float = const.G * planet.M * self.wind_mu / (2.0 * const.k_B * T)
+            # v_terminal/v_base are unused by the Parker solution.
+            self.v_terminal: float = v_terminal
+            self.v_base: float = None
+        elif wind_model == 'beta':
+            if v_terminal is None:
+                raise ValueError("wind_model='beta' requires v_terminal [cm/s].")
+            self.v_terminal: float = v_terminal
+            # Finite launch speed; default to 0.1% of terminal speed.  Guard
+            # against non-positive values, which would re-introduce the density
+            # divergence.
+            v_base = v_base if v_base is not None else v_terminal * 1e-3
+            self.v_base: float = v_base if v_base > 0. else v_terminal * 1e-3
+        else:
+            raise ValueError(f"Unknown wind_model {wind_model!r}; "
+                             "use 'beta' or 'parker'.")
+
+    def _wind_velocity(self, r: np.ndarray) -> np.ndarray:
+        """Wind speed at radius ``r``, dispatched by :attr:`wind_model`."""
+        if self.wind_model == 'parker':
+            return self._wind_velocity_parker(r)
+        # Modified beta-law velocity with a finite base speed:
+        # v(r) = v_base + (v_terminal − v_base) · max(1 − r_inner/r, 0)^beta,
+        # so v(r_inner) = v_base > 0 and the mass-continuity number density
+        # stays finite everywhere in the wind.
+        r_safe = np.where(r > 0, r, self.r_inner)
+        arg = np.clip(1.0 - self.r_inner / r_safe, 0.0, None)
+        return self.v_base + (self.v_terminal - self.v_base) * arg ** self.beta
+
+    def _wind_velocity_parker(self, r: np.ndarray) -> np.ndarray:
+        """Isothermal Parker-wind speed via the Lambert-W solution [cm/s].
+
+        The steady, isothermal, spherically symmetric momentum + continuity
+        equations reduce to the dimensionless transonic relation
+
+            (v/c_s)² − ln[(v/c_s)²] = 4 ln(r/r_c) + 4 r_c/r − 3 ≡ D(r),
+
+        with isothermal sound speed c_s = √(k_B T / μ) and sonic radius
+        r_c = G M μ / (2 k_B T).  Writing y = (v/c_s)² this is y − ln y = D,
+        whose closed form is
+
+            y = −W_b(−e^{−D}),
+
+        where W is the Lambert-W function: the principal branch (b = 0) gives
+        the subsonic solution for r < r_c, and the W₋₁ branch gives the
+        supersonic solution for r > r_c.  The argument −e^{−D} ∈ [−1/e, 0)
+        because D ≥ 1 (minimum at the sonic point), so the solution is real
+        everywhere.
+
+        Because the wind is launched at a finite, sub-sonic speed, the
+        mass-continuity number density n ∝ 1/(r² v) stays finite with no
+        free base-velocity floor.
+        """
+        r_safe = np.where(r > 0, r, self.r_inner)
+        lam = r_safe / self.r_c
+        D = 4.0 * np.log(lam) + 4.0 / lam - 3.0
+        # Argument of W lies in [-1/e, 0).  Floor it at the next double toward
+        # zero from the branch point -1/e: scipy's lambertw returns NaN exactly
+        # at -1/e, and any numerical overshoot just below it is unphysical.
+        arg = np.maximum(-np.exp(-D), np.nextafter(-1.0 / np.e, 0.0))
+        # lambertw is not vectorized over the branch index, so evaluate both
+        # real branches and select per cell (subsonic inside r_c, supersonic
+        # outside).
+        w0 = np.real(lambertw(arg, 0))
+        wm1 = np.real(lambertw(arg, -1))
+        w = np.where(r_safe > self.r_c, wm1, w0)
+        return self.c_s * np.sqrt(np.maximum(-w, 0.0))
+
+    def calculateNumberDensity(self, x: np.ndarray, phi, rho, orbphase) -> np.ndarray:
+        """Number density from mass continuity n = Mdot / (4π r² v(r) μ).
+
+        Supports scalar and batch (array) phi, rho, orbphase inputs.
+
+        Args:
+            x (np.ndarray): LOS coordinates (n_x,) [cm].
+            phi: Azimuthal angle(s) [rad].  Scalar or (n_chords,).
+            rho: Projected radius (radii) [cm].  Scalar or (n_chords,).
+            orbphase: Orbital phase(s) [rad].  Scalar or (n_chords,).
+
+        Returns:
+            np.ndarray: Number density (n_x,) or (n_chords, n_x) [cm⁻³].
+        """
+        r = self.planet.getDistanceFromPlanet(x, phi, rho, orbphase)
+        v = self._wind_velocity(r)
+        # Guard r=0 in intermediate division; the mask below zeroes these cells.
+        r_safe = np.where(r > 0, r, 1.0)
+        n = self.Mdot / (4.0 * np.pi * r_safe ** 2 * v * self.mu)
+        mask = np.heaviside(r - self.r_inner, 0.0)
+        if self.r_outer is not None:
+            mask *= np.heaviside(self.r_outer - r, 0.0)
+        return n * mask
+
+    def calculateLOSVelocity(self, x_grid: np.ndarray, phi_batch: np.ndarray,
+                              rho_batch: np.ndarray,
+                              orbphase_batch: np.ndarray) -> np.ndarray:
+        """LOS projection of the radial outflow velocity (n_chords, n_x) [cm/s].
+
+        The sign convention matches :meth:`celestialBodies.Planet.getLOSvelocity`:
+        the returned value is the velocity component along +x, i.e. **positive
+        for gas moving away from the observer (redshift)**, since the observer
+        sits at x = −∞.  This is essential because the result is summed with the
+        bulk orbital velocity ``v_bulk`` (also in the +x convention) inside
+        :meth:`Atmosphere.getLOSopticalDepth_Batch` before the Doppler shift is
+        applied.  The bulk orbital velocity is NOT included here.
+
+        For a radial outflow the gas velocity vector is v_radial · r̂, whose +x
+        component is v_radial · (x − x_p)/r.  Gas behind the planet (x > x_p,
+        dx > 0) recedes from the observer (redshift); near-side gas (dx < 0)
+        approaches (blueshift).
+
+        Args:
+            x_grid (np.ndarray): LOS positions (n_x,) [cm].
+            phi_batch (np.ndarray): Azimuthal angles (n_chords,) [rad].
+            rho_batch (np.ndarray): Projected radii (n_chords,) [cm].
+            orbphase_batch (np.ndarray): Orbital phases (n_chords,) [rad].
+
+        Returns:
+            np.ndarray: LOS velocity field (n_chords, n_x) [cm/s].
+        """
+        r = self.planet.getDistanceFromPlanet(x_grid, phi_batch, rho_batch, orbphase_batch)
+        v_radial = self._wind_velocity(r)  # (n_chords, n_x)
+        x_p = self.planet.a * np.cos(orbphase_batch)        # (n_chords,)
+        dx = x_grid[np.newaxis, :] - x_p[:, np.newaxis]    # (n_chords, n_x); positive = behind planet
+        r_safe = np.where(r > 0, r, 1.0)
+        # +x component of the radial outflow (away-from-observer = redshift > 0),
+        # matching the sign convention of planet.getLOSvelocity.
+        return v_radial * dx / r_safe
 
 
 """
@@ -818,6 +1071,298 @@ class MolecularConstituent:
         return sigma_absFlattened.reshape(n_chords, n_x, n_wav)
 
 
+# Reserved species keys identifying continuum scattering/aerosol constituents.
+# These are matched in prometheus.py and setup.py to distinguish scattering
+# sources from atomic/ionic species and molecular HDF5 lookup tables.
+SCATTERER_TYPES: Tuple[str, ...] = ('RayleighHaze', 'GrayCloud', 'PowerLawAerosol', 'TabulatedAerosol')
+
+
+class ScatteringConstituent:
+    """Base class for continuum scattering / aerosol opacity sources.
+
+    Scattering constituents contribute a wavelength-only extinction
+    cross-section that acts per host-gas particle. The extincting number
+    density is the host scenario's gas number density scaled by the abundance
+    ``chi`` (a particle-to-gas ratio). In transit transmission, photons
+    scattered out of the line of sight are lost from the beam, so the
+    extinction cross-section is added directly to the Beer-Lambert optical
+    depth — no scattering phase function or multiple scattering is modelled.
+
+    Attributes:
+        isMolecule (bool): Always False (kept for branch compatibility with the
+            existing atomic/molecular optical-depth code paths).
+        isScatterer (bool): Flag identifying this as a scattering source.
+        chi (float): Abundance of the scattering particles relative to the host
+            gas number density (particle-to-gas ratio).
+        P_top (Optional[float]): If set, the opacity only applies where the
+            local gas pressure is >= P_top (cgs, barye), confining the cloud
+            below a cloud-top pressure. Requires a temperature-bearing host
+            scenario (e.g. barometric/hydrostatic); ignored otherwise.
+    """
+
+    def __init__(self, chi: float, P_top: Union[float, None] = None):
+        """Initializes the ScatteringConstituent.
+
+        Args:
+            chi (float): Particle-to-gas abundance ratio.
+            P_top (Optional[float]): Cloud-top pressure in cgs (barye). The
+                opacity is confined to where the local pressure exceeds this
+                value. Defaults to None (no confinement).
+        """
+        self.isMolecule: bool = False
+        self.isScatterer: bool = True
+        self.chi: float = chi
+        self.P_top: Union[float, None] = P_top
+        self._sigma_cache: dict = {}
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        """Returns the extinction cross-section [cm^2] on a wavelength grid.
+
+        Must be implemented by subclasses.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Extinction cross-section per particle [cm^2].
+        """
+        raise NotImplementedError
+
+    def addLookupFunctionToConstituent(self, wavelengthGrid: 'WavelengthGrid' = None) -> None:
+        """No-op kept for interface symmetry with atomic/molecular constituents.
+
+        Scattering cross-sections are smooth and analytic, so no precomputed
+        lookup table is required; `getSigmaAbs` evaluates them directly (with
+        light caching).
+        """
+        return None
+
+    def getSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        """Returns the (cached) extinction cross-section on a wavelength grid.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Extinction cross-section per particle [cm^2], same
+                shape as `wavelength`.
+        """
+        key = wavelength.shape, wavelength.tobytes()
+        sigma = self._sigma_cache.get(key)
+        if sigma is None:
+            sigma = self.calculateSigmaAbs(wavelength)
+            self._sigma_cache[key] = sigma
+        return sigma
+
+
+class RayleighHaze(ScatteringConstituent):
+    """Parametrized Rayleigh-scattering haze.
+
+    The extinction cross-section follows a power law in wavelength:
+    ``sigma(lambda) = sigma_ref * (lambda_ref / lambda) ** slope``. A slope of
+    4 corresponds to pure Rayleigh scattering; smaller values describe
+    flatter, more aerosol-like hazes.
+
+    Attributes:
+        sigma_ref (float): Reference cross-section at `lambda_ref` [cm^2].
+        lambda_ref (float): Reference wavelength [cm].
+        slope (float): Power-law exponent (4 for pure Rayleigh).
+    """
+
+    def __init__(self, chi: float = 1.0, sigma_ref: float = 5.31e-27,
+                 lambda_ref: float = 4000e-8, slope: float = 4.0,
+                 P_top: Union[float, None] = None):
+        """Initializes the RayleighHaze.
+
+        Args:
+            chi (float): Particle-to-gas abundance ratio. Defaults to 1.0.
+            sigma_ref (float): Reference cross-section at `lambda_ref` [cm^2].
+                Defaults to 5.31e-27 (~H2 Rayleigh at 4000 A).
+            lambda_ref (float): Reference wavelength [cm]. Defaults to 4000 A.
+            slope (float): Power-law exponent. Defaults to 4.0.
+            P_top (Optional[float]): Cloud-top pressure [barye]. Defaults to None.
+        """
+        super().__init__(chi, P_top)
+        self.sigma_ref: float = sigma_ref
+        self.lambda_ref: float = lambda_ref
+        self.slope: float = slope
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        """Computes the Rayleigh power-law cross-section.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Extinction cross-section [cm^2].
+        """
+        return self.sigma_ref * (self.lambda_ref / wavelength) ** self.slope
+
+
+class GrayCloud(ScatteringConstituent):
+    """Gray (wavelength-independent) cloud opacity.
+
+    Provides a flat extinction cross-section per host-gas particle. Combined
+    with the optional `P_top` confinement of the base class, this can represent
+    either a gray haze (no confinement) or an opaque cloud deck below a
+    cloud-top pressure.
+
+    Attributes:
+        sigma_gray (float): Wavelength-independent cross-section [cm^2].
+    """
+
+    def __init__(self, chi: float = 1.0, sigma_gray: float = 1e-10,
+                 P_top: Union[float, None] = None):
+        """Initializes the GrayCloud.
+
+        Args:
+            chi (float): Particle-to-gas abundance ratio. Defaults to 1.0.
+            sigma_gray (float): Wavelength-independent cross-section [cm^2].
+                Defaults to 1e-10.
+            P_top (Optional[float]): Cloud-top pressure [barye]. Defaults to None.
+        """
+        super().__init__(chi, P_top)
+        self.sigma_gray: float = sigma_gray
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        """Computes the gray (constant) cross-section.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Extinction cross-section [cm^2], constant across `wavelength`.
+        """
+        return np.full_like(wavelength, self.sigma_gray, dtype=np.float64)
+
+
+class PowerLawAerosol(ScatteringConstituent):
+    """Aerosol with a user-specified Ångström extinction exponent (alpha).
+
+    The extinction cross-section follows:
+        σ(λ) = σ_ref × (λ / λ_ref)^(−alpha)
+
+    This is the standard Ångström aerosol parameterization.  alpha = 4
+    recovers pure Rayleigh scattering; typical tropospheric aerosols have
+    alpha ≈ 1–2; values < 1 approach the gray (wavelength-independent) limit.
+
+    Scattering is treated as extinction out of the beam — no phase function or
+    multiple scattering is modelled.
+
+    Unlike :class:`RayleighHaze` (which uses the alternative notation
+    σ = σ_ref × (λ_ref/λ)^slope), this class exposes the exponent as ``alpha``
+    with the conventional sign, making it unambiguous in publications.
+
+    Attributes:
+        sigma_ref (float): Reference cross-section at lambda_ref [cm²].
+        lambda_ref (float): Reference wavelength [cm].
+        alpha (float): Ångström exponent.
+    """
+
+    def __init__(self, chi: float = 1.0, sigma_ref: float = 1e-25,
+                 lambda_ref: float = 5500e-8, alpha: float = 2.0,
+                 P_top: Union[float, None] = None):
+        super().__init__(chi, P_top)
+        self.sigma_ref: float = sigma_ref
+        self.lambda_ref: float = lambda_ref
+        self.alpha: float = alpha
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        return self.sigma_ref * (wavelength / self.lambda_ref) ** (-self.alpha)
+
+
+class TabulatedAerosol(ScatteringConstituent):
+    """Aerosol with cross-sections loaded from a two-column CSV file.
+
+    The CSV must have columns: wavelength [Angstrom], sigma [cm²] (no header,
+    or comment lines starting with ``#``).  Values are linearly interpolated
+    within the tabulated range.
+
+    Outside the table the extinction is, by default, held at the nearest edge
+    value (``extrapolate='edge'``).  A measured aerosol cross-section does not
+    physically vanish just because the table ends, so dropping straight to
+    σ = 0 would introduce a spurious opacity cliff at the table boundaries.
+    Pass ``extrapolate='zero'`` to recover the previous hard-cutoff behaviour.
+
+    Scattering is treated as extinction out of the beam — no phase function or
+    multiple scattering is modelled.
+
+    Attributes:
+        filepath (str): Path to the CSV cross-section table.
+        extrapolate (str): Out-of-range behaviour, ``'edge'`` or ``'zero'``.
+    """
+
+    def __init__(self, chi: float = 1.0, filepath: str = '',
+                 extrapolate: str = 'edge',
+                 P_top: Union[float, None] = None):
+        super().__init__(chi, P_top)
+        self.filepath: str = filepath
+        if extrapolate not in ('edge', 'zero'):
+            raise ValueError(
+                f"extrapolate must be 'edge' or 'zero', got {extrapolate!r}")
+        self.extrapolate: str = extrapolate
+        data = np.loadtxt(filepath, delimiter=',', comments='#')
+        wav_A, sigma_raw = data[:, 0], data[:, 1]
+        idx = np.argsort(wav_A)
+        self._wav_cm: np.ndarray = wav_A[idx] * 1e-8
+        self._sigma_table: np.ndarray = sigma_raw[idx]
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        if self.extrapolate == 'zero':
+            return np.interp(wavelength, self._wav_cm, self._sigma_table,
+                             left=0.0, right=0.0)
+        # 'edge': np.interp already holds the nearest edge value when left/right
+        # are not supplied.
+        return np.interp(wavelength, self._wav_cm, self._sigma_table)
+
+
+def makeScatteringConstituent(scattererType: str, paramsDict: dict) -> ScatteringConstituent:
+    """Factory for scattering constituents from a setup-file parameter dict.
+
+    Args:
+        scattererType (str): One of `SCATTERER_TYPES` ('RayleighHaze', 'GrayCloud').
+        paramsDict (dict): Parameter dictionary from the setup file.
+
+    Returns:
+        ScatteringConstituent: The constructed scattering constituent.
+
+    Raises:
+        ValueError: If `scattererType` is not recognized.
+    """
+    chi = paramsDict.get('chi', 1.0)
+    P_top = paramsDict.get('P_top', None)
+    if scattererType == 'RayleighHaze':
+        return RayleighHaze(
+            chi=chi,
+            sigma_ref=paramsDict.get('sigma_ref', 5.31e-27),
+            lambda_ref=paramsDict.get('lambda_ref', 4000e-8),
+            slope=paramsDict.get('slope', 4.0),
+            P_top=P_top,
+        )
+    elif scattererType == 'GrayCloud':
+        return GrayCloud(
+            chi=chi,
+            sigma_gray=paramsDict.get('sigma_gray', 1e-10),
+            P_top=P_top,
+        )
+    elif scattererType == 'PowerLawAerosol':
+        return PowerLawAerosol(
+            chi=chi,
+            sigma_ref=paramsDict.get('sigma_ref', 1e-25),
+            lambda_ref=paramsDict.get('lambda_ref', 5500e-8),
+            alpha=paramsDict.get('alpha', 2.0),
+            P_top=P_top,
+        )
+    elif scattererType == 'TabulatedAerosol':
+        return TabulatedAerosol(
+            chi=chi,
+            filepath=paramsDict['filepath'],
+            extrapolate=paramsDict.get('extrapolate', 'edge'),
+            P_top=P_top,
+        )
+    raise ValueError(f"Unknown scattering constituent type: {scattererType}")
+
+
 class Atmosphere:
     """Manages all atmospheric/exospheric density distributions for a simulation.
 
@@ -904,17 +1449,36 @@ class Atmosphere:
         total_tau = np.zeros((n_chords, n_wav))
 
         for dist_model in self.densityDistributionList:
-            # --- velocity: one value per chord, no loop ---
+            has_wind_velocity = hasattr(dist_model, 'calculateLOSVelocity')
+
+            # --- bulk orbital velocity (one value per chord) ---
             if self.hasOrbitalDopplerShift:
                 if not dist_model.hasMoon:
-                    v_los = dist_model.planet.getLOSvelocity(orbphase_batch)   # (n_chords,)
+                    v_bulk = dist_model.planet.getLOSvelocity(orbphase_batch)  # (n_chords,)
                 else:
-                    v_los = dist_model.moon.getLOSvelocity(orbphase_batch)     # (n_chords,)
+                    v_bulk = dist_model.moon.getLOSvelocity(orbphase_batch)    # (n_chords,)
             else:
-                v_los = np.zeros(n_chords)
+                v_bulk = np.zeros(n_chords)
 
-            shifts = const.calculateDopplerShift(-v_los)                       # (n_chords,)
-            shifted_wav = shifts[:, np.newaxis] * wavelength[np.newaxis, :]   # (n_chords, n_wav)
+            shifts = const.calculateDopplerShift(-v_bulk)                       # (n_chords,)
+            shifted_wav = shifts[:, np.newaxis] * wavelength[np.newaxis, :]    # (n_chords, n_wav)
+
+            # --- per-x velocity field for wind models ---
+            # When a model supplies calculateLOSVelocity, atomic absorbers receive
+            # a Doppler shift that varies along the LOS, capturing the asymmetric
+            # blueshift / redshift signature of an expanding wind.
+            # Existing models without this method use the fast bulk-shift path.
+            if has_wind_velocity and self.hasOrbitalDopplerShift:
+                v_wind = dist_model.calculateLOSVelocity(
+                    x_grid, phi_batch, rho_batch, orbphase_batch
+                )  # (n_chords, n_x)
+                v_total_field = v_wind + v_bulk[:, np.newaxis]                  # (n_chords, n_x)
+                shifts_field = const.calculateDopplerShift(-v_total_field)      # (n_chords, n_x)
+                # (n_chords, n_x, n_wav) — same memory footprint as molecular path
+                shifted_wav_field = (shifts_field[:, :, np.newaxis]
+                                     * wavelength[np.newaxis, np.newaxis, :])
+            else:
+                shifted_wav_field = None
 
             # --- density: fully vectorized, returns (n_chords, n_x) ---
             n_tot = dist_model.calculateNumberDensity(
@@ -923,35 +1487,45 @@ class Atmosphere:
 
             for constituent in dist_model.constituents:
                 if constituent.isMolecule:
-                    # Pressure field shape (n_chords, n_x)
-                    P = n_tot * const.k_B * dist_model.T
-                    # sigma is (n_chords, n_x, n_wav)
-                    sigma = constituent.getSigmaAbs(P, dist_model.T, shifted_wav)
-                    
-                    # Number density of absorber: (n_chords, n_x)
-                    n_abs = n_tot * constituent.chi
-
-                    # Integrate: sum(n * sigma * dx) along x-axis
-                    # Using einsum avoids creating a full (n_chords, n_x, n_wav) temporary
+                    P = n_tot * const.k_B * dist_model.T                        # (n_chords, n_x)
+                    sigma = constituent.getSigmaAbs(P, dist_model.T, shifted_wav)  # (n_chords, n_x, n_wav)
+                    n_abs = n_tot * constituent.chi                              # (n_chords, n_x)
                     total_tau += np.einsum('cx,cxw->cw', n_abs, sigma) * delta_x
-                else:
-                    # Atoms: sigma only depends on wavelength, not local pressure
-                    # Pre-calculating column density is fine here
-                    col_density = np.sum(n_tot * constituent.chi, axis=1) * delta_x
-                    unique_shifts, inverse = np.unique(shifts, return_inverse=True)
-                    cache_key = (
-                        unique_shifts.shape,
-                        unique_shifts.tobytes(),
-                        wavelength.shape,
-                        wavelength.tobytes(),
-                    )
-                    sigma_cache = getattr(constituent, "_batch_sigma_cache", {})
-                    if cache_key not in sigma_cache:
-                        unique_shifted_wav = unique_shifts[:, np.newaxis] * wavelength[np.newaxis, :]
-                        sigma_cache[cache_key] = constituent.getSigmaAbs(unique_shifted_wav)
-                        constituent._batch_sigma_cache = sigma_cache
-                    sigma = sigma_cache[cache_key][inverse]
-                    total_tau += col_density[:, np.newaxis] * sigma
+
+                elif getattr(constituent, 'isScatterer', False):
+                    # Continuum scattering: cross-section wavelength-only, no Doppler
+                    n_abs = n_tot * constituent.chi                              # (n_chords, n_x)
+                    if constituent.P_top is not None and hasattr(dist_model, 'T'):
+                        P = n_tot * const.k_B * dist_model.T
+                        n_abs = np.where(P >= constituent.P_top, n_abs, 0.0)
+                    col_density = np.sum(n_abs, axis=1) * delta_x               # (n_chords,)
+                    sigma = constituent.getSigmaAbs(wavelength)                  # (n_wav,)
+                    total_tau += col_density[:, np.newaxis] * sigma[np.newaxis, :]
+
+                else:  # atoms
+                    if shifted_wav_field is not None:
+                        # Per-x Doppler shift for wind models.
+                        # n_interp_log accepts arbitrary shapes, so (n_chords, n_x, n_wav) works.
+                        sigma = constituent.getSigmaAbs(shifted_wav_field)      # (n_chords, n_x, n_wav)
+                        n_abs = n_tot * constituent.chi                          # (n_chords, n_x)
+                        total_tau += np.einsum('cx,cxw->cw', n_abs, sigma) * delta_x
+                    else:
+                        # Fast path: single bulk Doppler shift per chord
+                        col_density = np.sum(n_tot * constituent.chi, axis=1) * delta_x
+                        unique_shifts, inverse = np.unique(shifts, return_inverse=True)
+                        cache_key = (
+                            unique_shifts.shape,
+                            unique_shifts.tobytes(),
+                            wavelength.shape,
+                            wavelength.tobytes(),
+                        )
+                        sigma_cache = getattr(constituent, "_batch_sigma_cache", {})
+                        if cache_key not in sigma_cache:
+                            unique_shifted_wav = unique_shifts[:, np.newaxis] * wavelength[np.newaxis, :]
+                            sigma_cache[cache_key] = constituent.getSigmaAbs(unique_shifted_wav)
+                            constituent._batch_sigma_cache = sigma_cache
+                        sigma = sigma_cache[cache_key][inverse]
+                        total_tau += col_density[:, np.newaxis] * sigma
 
         return total_tau
 
@@ -1061,7 +1635,7 @@ class WavelengthGrid:
         linesList: List[float] = []
         for densityDistribution in densityDistributionList:
             for constituent in densityDistribution.constituents:
-                if constituent.isMolecule:
+                if constituent.isMolecule or getattr(constituent, 'isScatterer', False):
                     continue
                 lines_w = constituent.getLineParameters(
                     np.array([self.lower_w, self.upper_w]))[0]
@@ -1145,15 +1719,24 @@ class Transit:
                 - F_in (np.ndarray): The attenuated flux received by the observer.
                 - F_out (np.ndarray): The unattenuated flux from that point on the star.
         """
-        Fstar = self.planet.hostStar.getFstar(phi, rho, self.wavelength)
-        F_out = rho * Fstar * self.wavelength / self.wavelength
+        if self.planet.hostStar.Fstar_function is not None:
+            Fstar = self.planet.hostStar.getFstar(phi, rho, self.wavelength)
+        else:
+            Fstar = np.ones_like(self.wavelength)
+        F_out = rho * Fstar
         if self.checkBlock(phi, rho, orbphase):
             F_in = np.zeros_like(self.wavelength)
             return F_in, F_out
         x = self.spatialGrid.constructXaxis()
         delta_x = self.spatialGrid.getDeltaX()
-        tau = self.atmosphere.getLOSopticalDepth(
-            x, phi, rho, orbphase, self.wavelength, delta_x)
+        tau = self.atmosphere.getLOSopticalDepth_Batch(
+            x,
+            np.array([phi]),
+            np.array([rho]),
+            np.array([orbphase]),
+            self.wavelength,
+            delta_x,
+        )[0]
         F_in = rho * Fstar * np.exp(-tau)
         return F_in, F_out
 
@@ -1183,20 +1766,33 @@ class Transit:
         star_shifts = const.calculateDopplerShift(v_star)
         
         has_molecules = any(
-            any(c.isMolecule for c in dist.constituents) 
+            any(c.isMolecule for c in dist.constituents)
             for dist in self.atmosphere.densityDistributionList
         )
-        
+
+        # Wind models with a per-line-of-sight velocity field take the
+        # position-dependent atomic Doppler path in getLOSopticalDepth_Batch,
+        # which allocates molecular-scale (n_chords, n_x, n_wav) cross-section
+        # arrays.  The chunk-size estimator must treat that path as "heavy"
+        # (is_molecular=True); otherwise it sizes batches from the cheap
+        # column-density estimate and the per-x tensor blows past the memory
+        # cap, risking a system OOM.
+        has_perx_wind = self.atmosphere.hasOrbitalDopplerShift and any(
+            hasattr(dist, 'calculateLOSVelocity')
+            for dist in self.atmosphere.densityDistributionList
+        )
+        heavy_path = has_molecules or has_perx_wind
+
         x_grid = self.spatialGrid.constructXaxis()
         n_x = len(x_grid)
 
         from . import memoryHandler as mem
         batch_size = mem.calculate_optimal_chunk_size(
-            len(chordGrid), 
-            n_wav, 
+            len(chordGrid),
+            n_wav,
             n_x,             # Pass n_x here
             max_memory_gb,
-            is_molecular=has_molecules
+            is_molecular=heavy_path
         )
         
         x_grid = self.spatialGrid.constructXaxis()

@@ -9,8 +9,6 @@ import json
 import numpy as np
 from datetime import datetime
 import os
-import multiprocessing as mp
-from functools import partial
 import pythonScripts.setup as setup
 import pythonScripts.gasProperties as gasprop
 import pythonScripts.celestialBodies as bodies
@@ -104,6 +102,27 @@ if __name__ == '__main__':
             scenario.addInterpolatedDensity(spatialGrid)
             scenarioList.append(scenario) # sigmaSmoothing hardcoded to 0, i.e. no Gaussian smoothing of the serpens density distribution.
 
+        elif key_scenario == 'radialWind':
+            s = scenarioDict['radialWind']
+            # r_inner_Rp stored in planet radii from setup; convert to cm.
+            # If r_inner_Rp == 0 or absent, default to planet.R.
+            r_inner_Rp = s.get('r_inner_Rp', 0.)
+            r_inner = planet.R * r_inner_Rp if r_inner_Rp > 0 else planet.R
+            r_outer_Rp = s.get('r_outer', None)
+            r_outer = planet.R * r_outer_Rp if r_outer_Rp is not None else None
+            scenarioList.append(gasprop.RadialWindExosphere(
+                Mdot=s['Mdot'],
+                mu=s['mu'],
+                v_terminal=s.get('v_terminal', None),
+                beta=s.get('beta', 1.0),
+                r_inner=r_inner,
+                r_outer=r_outer,
+                v_base=s.get('v_base', None),
+                wind_model=s.get('wind_model', 'beta'),
+                T=s.get('T', None),
+                planet=planet,
+            ))
+
 
 
     for idx, key_scenario in enumerate(scenarioDict.keys()):
@@ -114,15 +133,21 @@ if __name__ == '__main__':
                 if key_species in const.AvailableSpecies().listSpeciesNames(): # Atom/ion
                     scenarioList[idx].addConstituent(key_species, absorberDict['chi'])
                     scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
+                elif key_species in gasprop.SCATTERER_TYPES: # Scattering/aerosol
+                    scenarioList[idx].addScatteringConstituent(key_species, absorberDict)
+                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
                 else:
                     scenarioList[idx].addMolecularConstituent(key_species, absorberDict['chi'])
                     scenarioList[idx].constituents[-1].addLookupFunctionToConstituent()
-        
+
         else: # Evaporative scenario
             for key_species in speciesDict[key_scenario].keys():
                 absorberDict = speciesDict[key_scenario][key_species]
                 if key_species in const.AvailableSpecies().listSpeciesNames(): # Atom/ion
                     scenarioList[idx].addConstituent(key_species, absorberDict['sigma_v'])
+                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
+                elif key_species in gasprop.SCATTERER_TYPES: # Scattering/aerosol
+                    scenarioList[idx].addScatteringConstituent(key_species, absorberDict)
                     scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
                 else:
                     scenarioList[idx].addMolecularConstituent(key_species, absorberDict['T'])

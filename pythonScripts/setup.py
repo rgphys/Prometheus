@@ -218,7 +218,7 @@ Scenarios for the spatial distribution of the medium
 """
 
 QScenario = TextQuestion('Enter the name of the scenario for the number density profile or \
-0 to stop adding absorption sources:', False, ['barometric', 'hydrostatic', 'powerLaw', 'exomoon', 'torus', 'serpens', '0'])
+0 to stop adding absorption sources:', False, ['barometric', 'hydrostatic', 'powerLaw', 'exomoon', 'torus', 'serpens', 'radialWind', '0'])
 QTemperature = NumericalQuestion(
     'Enter the temperature of the atmosphere in Kelvin:', 1., 1e6, 1.)
 QPressure = NumericalQuestion(
@@ -237,6 +237,22 @@ QtorusEjectionSpeed = NumericalQuestion(
     'Enter the ejection velocity (which sets the torus scale height) of the particles from the torus in km/s:', 1e-2, 1e3, 1e5)
 QserpensPath = TextQuestion(
     'Enter the full path to the serpens input txt file, including the filename with the .txt ending:')
+QwindMdot = NumericalQuestion(
+    'Enter the mass loss rate of the radial wind in g/s:', 1e-10, 1e30, 1.)
+QwindMu = NumericalQuestion(
+    'Enter the mean particle mass of the wind in atomic mass units:', 0.05, 500., const.amu)
+QwindModel = TextQuestion(
+    "Choose the wind velocity model ('beta' = parametrized beta-law, \
+'parker' = exact isothermal Parker wind):", False, ['beta', 'parker'])
+QwindTemperature = NumericalQuestion(
+    'Enter the (isothermal) wind temperature in Kelvin:', 1., 1e6, 1.)
+QwindVterminal = NumericalQuestion(
+    'Enter the terminal (reference) wind velocity in km/s:', 0.1, 1e5, 1e5)
+QwindBeta = NumericalQuestion(
+    'Enter the beta-law exponent for the wind velocity profile (1 = linear, 2 = quadratic):', 0.1, 10., 1.)
+QwindRinner = NumericalQuestion(
+    'Enter the inner wind boundary in planetary radii (0 = use planet radius):', 0., 100., 1.)
+QwindRouter = TextQuestion('Do you want to set an outer cutoff radius for the wind?', True)
 
 
 def setupScenario(fundamentalsDict):
@@ -300,6 +316,25 @@ def setupScenario(fundamentalsDict):
         elif scenario_name == 'serpens':
 
             params['serpensPath'] = QserpensPath.readStr()
+
+        elif scenario_name == 'radialWind':
+
+            params['Mdot'] = QwindMdot.readValue()
+            params['mu'] = QwindMu.readValue()
+            params['wind_model'] = QwindModel.readStr()
+            if params['wind_model'] == 'parker':
+                # Parker wind shape is set by temperature + planet mass; no
+                # beta/v_terminal knobs are needed.
+                params['T'] = QwindTemperature.readValue()
+            else:
+                params['v_terminal'] = QwindVterminal.readValue()
+                params['beta'] = QwindBeta.readValue()
+            r_inner_Rp = QwindRinner.readValue()
+            # Store in planet radii; converted to cm in prometheus.py using planet.R
+            params['r_inner_Rp'] = r_inner_Rp  # 0 → use planet.R (handled in prometheus.py)
+            if QwindRouter.readStr():
+                params['r_outer'] = NumericalQuestion(
+                    'Enter the outer wind cutoff radius in planetary radii:', 1., 1e6, 1.).readValue()
 
         scenarioDict[scenario_name] = params
 
@@ -404,6 +439,95 @@ QMoleculesTemperature = NumericalQuestion(
     'Enter the pseudo-temperature for the molecular absorber in K:', 100., 3400., 1.)
 
 
+def setupRayleighHaze(key_scenario):
+    """Collects parameters for a parametrized Rayleigh-scattering haze.
+
+    Args:
+        key_scenario (str): The name of the host density scenario.
+
+    Returns:
+        tuple[str, dict]: The reserved species key ('RayleighHaze') and its
+            parameter dictionary.
+    """
+    params = {}
+    params['chi'] = NumericalQuestion('Enter the abundance (particle-to-gas number ratio) of the Rayleigh haze in the ' +
+                                      key_scenario + ' scenario:', 0., 1e30, 1., acceptLowerBorder=False).readValue()
+    params['sigma_ref'] = NumericalQuestion(
+        'Enter the reference Rayleigh extinction cross-section (sigma_ref) in cm^2:', 0., 1., 1., acceptLowerBorder=False).readValue()
+    params['lambda_ref'] = NumericalQuestion(
+        'Enter the reference wavelength (lambda_ref) for the Rayleigh cross-section in Angstrom:', 500, 55000, 1e-8, roundBorders=False).readValue()
+    params['slope'] = NumericalQuestion(
+        'Enter the Rayleigh slope exponent (4 corresponds to pure Rayleigh scattering):', 0., 20., 1.).readValue()
+    return 'RayleighHaze', params
+
+
+def setupGrayCloud(key_scenario):
+    """Collects parameters for a gray (wavelength-independent) cloud/aerosol.
+
+    Args:
+        key_scenario (str): The name of the host density scenario.
+
+    Returns:
+        tuple[str, dict]: The reserved species key ('GrayCloud') and its
+            parameter dictionary.
+    """
+    params = {}
+    params['chi'] = NumericalQuestion('Enter the abundance (particle-to-gas number ratio) of the gray cloud in the ' +
+                                      key_scenario + ' scenario:', 0., 1e30, 1., acceptLowerBorder=False).readValue()
+    params['sigma_gray'] = NumericalQuestion(
+        'Enter the gray (wavelength-independent) extinction cross-section in cm^2:', 0., 1., 1., acceptLowerBorder=False).readValue()
+    if TextQuestion('Do you want to confine the cloud below a cloud-top pressure (opaque deck)?', True).readStr():
+        params['P_top'] = NumericalQuestion(
+            'Enter the cloud-top pressure in cgs units (barye):', 0., 1e12, 1., acceptLowerBorder=False).readValue()
+    return 'GrayCloud', params
+
+
+def setupPowerLawAerosol(key_scenario):
+    """Collects parameters for a power-law aerosol with user-specified Ångström exponent.
+
+    Args:
+        key_scenario (str): The name of the host density scenario.
+
+    Returns:
+        tuple[str, dict]: The reserved key ('PowerLawAerosol') and its parameter dict.
+    """
+    params = {}
+    params['chi'] = NumericalQuestion('Enter the abundance (particle-to-gas number ratio) of the aerosol in the ' +
+                                      key_scenario + ' scenario:', 0., 1e30, 1., acceptLowerBorder=False).readValue()
+    params['sigma_ref'] = NumericalQuestion(
+        'Enter the reference extinction cross-section (sigma_ref) in cm^2:', 0., 1., 1., acceptLowerBorder=False).readValue()
+    params['lambda_ref'] = NumericalQuestion(
+        'Enter the reference wavelength (lambda_ref) in Angstrom:', 500, 55000, 1e-8, roundBorders=False).readValue()
+    params['alpha'] = NumericalQuestion(
+        'Enter the Angstrom exponent alpha (4 = Rayleigh, ~2 = typical aerosol, ~0 = gray):', 0., 20., 1.).readValue()
+    if TextQuestion('Do you want to confine the aerosol below a cloud-top pressure?', True).readStr():
+        params['P_top'] = NumericalQuestion(
+            'Enter the cloud-top pressure in cgs units (barye):', 0., 1e12, 1., acceptLowerBorder=False).readValue()
+    return 'PowerLawAerosol', params
+
+
+def setupTabulatedAerosol(key_scenario):
+    """Collects parameters for a tabulated aerosol loaded from a CSV file.
+
+    The CSV must have columns: wavelength [Angstrom], sigma [cm^2].
+
+    Args:
+        key_scenario (str): The name of the host density scenario.
+
+    Returns:
+        tuple[str, dict]: The reserved key ('TabulatedAerosol') and its parameter dict.
+    """
+    params = {}
+    params['chi'] = NumericalQuestion('Enter the abundance (particle-to-gas number ratio) of the tabulated aerosol in the ' +
+                                      key_scenario + ' scenario:', 0., 1e30, 1., acceptLowerBorder=False).readValue()
+    params['filepath'] = TextQuestion(
+        'Enter the full path to the aerosol cross-section CSV file (columns: wavelength[A], sigma[cm^2]):').readStr()
+    if TextQuestion('Do you want to confine the aerosol below a cloud-top pressure?', True).readStr():
+        params['P_top'] = NumericalQuestion(
+            'Enter the cloud-top pressure in cgs units (barye):', 0., 1e12, 1., acceptLowerBorder=False).readValue()
+    return 'TabulatedAerosol', params
+
+
 def setupSpecies(scenarioDict):
     """Conducts a Q&A session for the absorbing species.
 
@@ -425,32 +549,54 @@ def setupSpecies(scenarioDict):
 
     for key_scenario in scenarioDict.keys():
 
-        QabsorberType = TextQuestion('Do you want to add an atomic/ionic or a molecular absorber (the atom option includes ions) in the ' +
-                                     key_scenario + ' scenario?', False, ['atom', 'molecule'])
+        hasTemperature = 'T' in scenarioDict[key_scenario].keys()
+        isWindScenario = (key_scenario == 'radialWind')
+        # Continuum scattering sources are offered for collisional scenarios where
+        # a cloud-top pressure can be defined.  PowerLawAerosol and TabulatedAerosol
+        # are also available for collisional scenarios.
+        if hasTemperature:
+            absorberOptions = ['atom', 'molecule', 'rayleigh', 'gray', 'powerlawaerosol', 'tabulatedaerosol']
+        else:
+            absorberOptions = ['atom', 'molecule']
+        QabsorberType = TextQuestion('Which absorber type do you want to add in the ' + key_scenario +
+                                     ' scenario (atom includes ions; rayleigh/gray/powerlawaerosol/tabulatedaerosol are continuum scattering sources)?',
+                                     False, absorberOptions)
         PossibleAbsorbers = const.AvailableSpecies().listSpeciesNames()
 
         speciesDict[key_scenario] = {}
-        params = {}
 
         # Scenarios that incorporate a temperature
-        if 'T' in scenarioDict[key_scenario].keys():
+        if hasTemperature:
 
             while True:
 
                 absorberType = QabsorberType.readStr()
+                params = {}
 
                 if absorberType == 'atom':
 
                     key_species = TextQuestion('Enter the name of the absorbing species you want to consider for the ' +
                                                key_scenario + ' scenario:', False, PossibleAbsorbers).readStr()
-                    # params['sigma_v'] = np.sqrt(const.k_B * scenarioDict[key_scenario]['T'] / const.AvailableSpecies().findSpecies(key_species).mass) # Velocity dispersion only for atoms/ions
                     PossibleAbsorbers.remove(key_species)
+                    params['chi'] = NumericalQuestion('Enter the mixing ratio of ' + key_species + ' in the ' +
+                                                      key_scenario + ' scenario:', 0., 1., 1., acceptLowerBorder=False).readValue()
 
-                else:
+                elif absorberType == 'molecule':
                     key_species = Qmolecule.readStr()
+                    params['chi'] = NumericalQuestion('Enter the mixing ratio of ' + key_species + ' in the ' +
+                                                      key_scenario + ' scenario:', 0., 1., 1., acceptLowerBorder=False).readValue()
 
-                params['chi'] = NumericalQuestion('Enter the mixing ratio of ' + key_species + ' in the ' +
-                                                  key_scenario + ' scenario:', 0., 1., 1., acceptLowerBorder=False).readValue()
+                elif absorberType == 'rayleigh':
+                    key_species, params = setupRayleighHaze(key_scenario)
+
+                elif absorberType == 'gray':
+                    key_species, params = setupGrayCloud(key_scenario)
+
+                elif absorberType == 'powerlawaerosol':
+                    key_species, params = setupPowerLawAerosol(key_scenario)
+
+                else:  # tabulatedaerosol
+                    key_species, params = setupTabulatedAerosol(key_scenario)
 
                 speciesDict[key_scenario][key_species] = params
 
@@ -463,6 +609,7 @@ def setupSpecies(scenarioDict):
         else:  # Evaporative scenarios (no temperature), only one absorbing species
 
             absorberType = QabsorberType.readStr()
+            params = {}
 
             if absorberType == 'atom':
                 key_species = TextQuestion('Enter the name of the absorbing species you want to consider for the ' +
@@ -473,8 +620,11 @@ def setupSpecies(scenarioDict):
                 key_species = Qmolecule.readStr()
                 params['T'] = QMoleculesTemperature.readValue()
 
-            params['Nparticles'] = NumericalQuestion('Enter the number of ' + key_species + ' particles in the ' +
-                                                     key_scenario + ' scenario:', 0., 1e50, 1., acceptLowerBorder=False).readValue()
+            # radialWind derives particle density from mass continuity (Mdot/v/r²);
+            # Nparticles is not used and not asked for.
+            if not isWindScenario:
+                params['Nparticles'] = NumericalQuestion('Enter the number of ' + key_species + ' particles in the ' +
+                                                         key_scenario + ' scenario:', 0., 1e50, 1., acceptLowerBorder=False).readValue()
 
             speciesDict[key_scenario][key_species] = params
 

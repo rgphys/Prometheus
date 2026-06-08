@@ -40,11 +40,15 @@ def estimate_chord_memory(
     # float64 = 8 bytes
     
     if is_molecular:
-        # Peak memory per chord in getSigmaAbs:
+        # Peak memory per chord on the heavy (n_chords, n_x, n_wav) path:
         # PFlattened (8) + wavelengthFlattened (8) + TFlattened (8) +
         # inputArray (24) + sigma_abs (8) + result (8) = ~64 bytes per point
-        # Plus the einsum output (n_wav * 8) is small in comparison
-        bytes_per_chord = n_x * num_wavelengths * 64
+        # for the bookkeeping arrays.  On top of that, RegularGridInterpolator
+        # (used for molecular lookups) transiently allocates corner-weight and
+        # gathered-value arrays of order ~2^ndim per query point, so the true
+        # peak is several times the bookkeeping size.  Budget ~160 bytes/point
+        # to keep batches safely under the cap.
+        bytes_per_chord = n_x * num_wavelengths * 160
     else:
         # Atomic is much lighter
         bytes_per_chord = num_wavelengths * 16
