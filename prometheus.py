@@ -138,7 +138,7 @@ if __name__ == '__main__':
                     scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
                 else:
                     scenarioList[idx].addMolecularConstituent(key_species, absorberDict['chi'])
-                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent()
+                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
 
         else: # Evaporative scenario
             for key_species in speciesDict[key_scenario].keys():
@@ -151,7 +151,7 @@ if __name__ == '__main__':
                     scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
                 else:
                     scenarioList[idx].addMolecularConstituent(key_species, absorberDict['T'])
-                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent()
+                    scenarioList[idx].constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
 
     atmos = gasprop.Atmosphere(scenarioList, fundamentalsDict['DopplerOrbitalMotion'])
 

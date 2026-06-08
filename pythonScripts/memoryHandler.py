@@ -40,15 +40,13 @@ def estimate_chord_memory(
     # float64 = 8 bytes
     
     if is_molecular:
-        # Peak memory per chord on the heavy (n_chords, n_x, n_wav) path:
-        # PFlattened (8) + wavelengthFlattened (8) + TFlattened (8) +
-        # inputArray (24) + sigma_abs (8) + result (8) = ~64 bytes per point
-        # for the bookkeeping arrays.  On top of that, RegularGridInterpolator
-        # (used for molecular lookups) transiently allocates corner-weight and
-        # gathered-value arrays of order ~2^ndim per query point, so the true
-        # peak is several times the bookkeeping size.  Budget ~160 bytes/point
-        # to keep batches safely under the cap.
-        bytes_per_chord = n_x * num_wavelengths * 160
+        # With the decomposed bilinear P-T + 1-D wavelength interpolation,
+        # the molecular path no longer materialises the full (C, X, W) tensor.
+        # Peak memory per chord is dominated by the native-wavelength-grid
+        # intermediates: sigma_eff (n_wav_native * 8) + sigma_xi (n_wav_native * 8).
+        # n_wav_native is typically 5-10x larger than n_wav.  Budget ~640
+        # bytes per output wavelength point as a conservative proxy.
+        bytes_per_chord = num_wavelengths * 640
     else:
         # Atomic is much lighter
         bytes_per_chord = num_wavelengths * 16

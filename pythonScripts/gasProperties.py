@@ -34,21 +34,136 @@ molecularLookupPath: str = os.path.dirname(os.path.dirname(
 @njit(parallel=True, fastmath=True)
 def n_interp_log(x_targets, x_grid, y_grid_log, offset):
     """
-    Numba-accelerated vectorized linear interpolation.
-    Processes millions of points across multiple CPU cores.
+    Numba-accelerated linear interpolation with O(N+M) two-pointer scan.
+    Assumes the last axis of x_targets is monotonically non-decreasing,
+    which holds for all Doppler-shifted wavelength grids in Prometheus.
     """
-    out = np.empty(x_targets.shape, dtype=np.float64)
-    # Flatten for interpolation, then reshape back
-    flat_targets = x_targets.ravel()
-    flat_out = np.empty(flat_targets.shape, dtype=np.float64)
-    
-    # xp must be increasing for np.interp
-    for i in prange(len(flat_targets)):
-        # np.interp is supported by Numba and is much faster than scipy interp1d
-        log_val = np.interp(flat_targets[i], x_grid, y_grid_log)
-        flat_out[i] = 10**log_val - offset
-        
-    return flat_out.reshape(x_targets.shape)
+    shape = x_targets.shape
+    n_last = shape[-1]
+    n_rows = 1
+    for d in range(len(shape) - 1):
+        n_rows *= shape[d]
+
+    flat = x_targets.reshape(n_rows, n_last)
+    out = np.empty((n_rows, n_last), dtype=np.float64)
+    m = len(x_grid)
+
+    for row in prange(n_rows):
+        j = 0
+        for i in range(n_last):
+            xi = flat[row, i]
+            # Advance pointer — valid because input rows are monotonic
+            while j < m - 2 and x_grid[j + 1] < xi:
+                j += 1
+            if xi <= x_grid[0]:
+                log_val = y_grid_log[0]
+            elif xi >= x_grid[m - 1]:
+                log_val = y_grid_log[m - 1]
+            else:
+                t = (xi - x_grid[j]) / (x_grid[j + 1] - x_grid[j])
+                log_val = y_grid_log[j] + t * (y_grid_log[j + 1] - y_grid_log[j])
+            out[row, i] = 10.0 ** log_val - offset
+
+    return out.reshape(shape)
+
+
+@njit(parallel=True, fastmath=True)
+def n_interp_linear_rows(x_targets, x_grid, y_grid_2d):
+    """
+    Row-wise 1D linear interpolation in *linear* space with O(N+M)
+    two-pointer scan.  Each row of y_grid_2d is interpolated independently
+    onto the corresponding row of x_targets.
+
+    x_targets: (n_rows, n_out) — monotonically increasing along axis 1
+    x_grid:    (M,) — sorted reference grid (shared across all rows)
+    y_grid_2d: (n_rows, M) — per-row function values on x_grid
+    Returns:   (n_rows, n_out)
+    """
+    n_rows = x_targets.shape[0]
+    n_out = x_targets.shape[1]
+    m = len(x_grid)
+    out = np.empty((n_rows, n_out), dtype=np.float64)
+
+    for row in prange(n_rows):
+        j = 0
+        for i in range(n_out):
+            xi = x_targets[row, i]
+            while j < m - 2 and x_grid[j + 1] < xi:
+                j += 1
+            if xi <= x_grid[0]:
+                out[row, i] = y_grid_2d[row, 0]
+            elif xi >= x_grid[m - 1]:
+                out[row, i] = y_grid_2d[row, m - 1]
+            else:
+                t = (xi - x_grid[j]) / (x_grid[j + 1] - x_grid[j])
+                out[row, i] = y_grid_2d[row, j] + t * (y_grid_2d[row, j + 1] - y_grid_2d[row, j])
+
+    return out
+
+
+@njit(parallel=True, fastmath=True)
+def _bilinear_PT_interp(P_vals, T_val, P_grid, T_grid, sigma_grid_log, lookupOffset):
+    """
+    Bilinear interpolation over the (P, T) dimensions of a molecular
+    cross-section lookup table, returning sigma in *linear* space on the
+    native wavelength grid.  Avoids the cost of a full 3-D scattered
+    RegularGridInterpolator evaluation.
+
+    P_vals:         (n_points,)
+    T_val:          float (scalar, constant per scenario)
+    P_grid:         (n_P,) — sorted pressure axis
+    T_grid:         (n_T,) — sorted temperature axis
+    sigma_grid_log: (n_P, n_T, n_wav_native) — log10(sigma + offset)
+    lookupOffset:   float
+
+    Returns: (n_points, n_wav_native)
+    """
+    n_points = len(P_vals)
+    n_P = len(P_grid)
+    n_T = len(T_grid)
+    n_wav = sigma_grid_log.shape[2]
+    out = np.empty((n_points, n_wav), dtype=np.float64)
+
+    # T bracket (constant for all points)
+    ti = np.searchsorted(T_grid, T_val) - 1
+    if ti < 0:
+        ti = 0
+    if ti >= n_T - 1:
+        ti = n_T - 2
+    t_T = (T_val - T_grid[ti]) / (T_grid[ti + 1] - T_grid[ti])
+    w_T0 = 1.0 - t_T
+    w_T1 = t_T
+
+    for p in prange(n_points):
+        P_val = P_vals[p]
+        # P bracket with clamping
+        if P_val <= P_grid[0]:
+            pi = 0
+            t_P = 0.0
+        elif P_val >= P_grid[n_P - 1]:
+            pi = n_P - 2
+            t_P = 1.0
+        else:
+            pi = np.searchsorted(P_grid, P_val) - 1
+            if pi < 0:
+                pi = 0
+            if pi >= n_P - 1:
+                pi = n_P - 2
+            t_P = (P_val - P_grid[pi]) / (P_grid[pi + 1] - P_grid[pi])
+
+        w00 = (1.0 - t_P) * w_T0
+        w10 = t_P * w_T0
+        w01 = (1.0 - t_P) * w_T1
+        w11 = t_P * w_T1
+
+        for w in range(n_wav):
+            log_val = (w00 * sigma_grid_log[pi, ti, w]
+                     + w10 * sigma_grid_log[pi + 1, ti, w]
+                     + w01 * sigma_grid_log[pi, ti + 1, w]
+                     + w11 * sigma_grid_log[pi + 1, ti + 1, w])
+            out[p, w] = 10.0 ** log_val - lookupOffset
+
+    return out
 
 class CollisionalAtmosphere:
     """Base class for a collisional atmosphere with a defined temperature and pressure.
@@ -1015,27 +1130,73 @@ class MolecularConstituent:
         self.moleculeName: str = moleculeName
         self.chi: float = chi
 
-    def constructLookupFunction(self) -> Callable[[np.ndarray], np.ndarray]:
+    def constructLookupFunction(self, wavelengthGrid=None) -> Callable[[np.ndarray], np.ndarray]:
         """Creates an interpolation function from an HDF5 cross-section file.
 
         Reads pressure, temperature, wavelength, and cross-section data from
-        an HDF5 file and creates a RegularGridInterpolator.
+        an HDF5 file.  The raw grid arrays are stored on the object for the
+        fast decomposed (bilinear P-T + 1-D wavelength) interpolation path
+        used by getLOSopticalDepth_Batch.  A RegularGridInterpolator is also
+        kept for backward compatibility with getSigmaAbs.
+
+        If wavelengthGrid is supplied the stored wav_grid and sigma_grid_log
+        are sliced to the simulation wavelength range plus a 1 % Doppler
+        margin.  This reduces the per-chord bilinear kernel from O(76k) to
+        O(N_sim) wavelength points — a large speedup for narrow grids.
 
         Returns:
             Callable[[np.ndarray], np.ndarray]: The interpolation function.
         """
+        _DOPPLER_MARGIN = 0.01  # 1 % covers ~3000 km/s, well beyond any orbital speed
+
         with h5py.File(molecularLookupPath + self.moleculeName + '.h5', 'r+') as f:
             P = f['p'][:] * 10.
             T = f['t'][:]
-            wavelength = 1. / f['bin_edges'][:][::-1]
-            sigma_abs = f['xsecarr'][:][:, :, ::-1]
-            lookupFunction = RegularGridInterpolator((P, T, wavelength), np.log10(
-                sigma_abs + self.lookupOffset), bounds_error=False, fill_value=np.log10(self.lookupOffset))
-            return lookupFunction
+            wav_full = 1. / f['bin_edges'][:][::-1]
 
-    def addLookupFunctionToConstituent(self) -> None:
-        """Constructs and attaches the lookup function to the object instance."""
-        lookupFunction = self.constructLookupFunction()
+            if wavelengthGrid is not None:
+                wav_min = wavelengthGrid.lower_w * (1.0 - _DOPPLER_MARGIN)
+                wav_max = wavelengthGrid.upper_w * (1.0 + _DOPPLER_MARGIN)
+                mask = (wav_full >= wav_min) & (wav_full <= wav_max)
+                if mask.sum() >= 2:
+                    # Contiguous index range so h5py reads only the needed slab
+                    lo, hi = int(np.argmax(mask)), int(len(mask) - np.argmax(mask[::-1]))
+                    n_full = len(wav_full)
+                    # sigma_abs is stored reversed relative to bin_edges, so the
+                    # wavelength slice [lo:hi] maps to original indices [n-hi:n-lo]
+                    sigma_abs = f['xsecarr'][:, :, n_full - hi:n_full - lo][:, :, ::-1]
+                    wavelength = wav_full[lo:hi]
+                else:
+                    sigma_abs = f['xsecarr'][:][:, :, ::-1]
+                    wavelength = wav_full
+            else:
+                sigma_abs = f['xsecarr'][:][:, :, ::-1]
+                wavelength = wav_full
+
+        sigma_log = np.log10(sigma_abs + self.lookupOffset)
+
+        # Store raw grids for the decomposed interpolation path
+        self.P_grid = np.ascontiguousarray(P)
+        self.T_grid = np.ascontiguousarray(T)
+        self.wav_grid = np.ascontiguousarray(wavelength)
+        self.sigma_grid_log = np.ascontiguousarray(sigma_log)
+
+        # Keep a RegularGridInterpolator for the legacy getSigmaAbs path
+        lookupFunction = RegularGridInterpolator(
+            (P, T, wavelength), sigma_log,
+            bounds_error=False,
+            fill_value=np.log10(self.lookupOffset))
+        return lookupFunction
+
+    def addLookupFunctionToConstituent(self, wavelengthGrid=None) -> None:
+        """Constructs and attaches the lookup function to the object instance.
+
+        Args:
+            wavelengthGrid: Optional WavelengthGrid.  When provided, the stored
+                cross-section table is sliced to the simulation wavelength range
+                so the per-chord Numba kernel operates on a much smaller array.
+        """
+        lookupFunction = self.constructLookupFunction(wavelengthGrid)
         self.lookupFunction: Callable[[
             np.ndarray], np.ndarray] = lookupFunction
 
@@ -1464,33 +1625,48 @@ class Atmosphere:
             shifted_wav = shifts[:, np.newaxis] * wavelength[np.newaxis, :]    # (n_chords, n_wav)
 
             # --- per-x velocity field for wind models ---
-            # When a model supplies calculateLOSVelocity, atomic absorbers receive
-            # a Doppler shift that varies along the LOS, capturing the asymmetric
-            # blueshift / redshift signature of an expanding wind.
-            # Existing models without this method use the fast bulk-shift path.
+            # Compute only the (n_chords, n_x) shift factors, NOT the full
+            # (n_chords, n_x, n_wav) tensor — the expansion is done lazily
+            # inside the per-x loop (Optimization 3).
             if has_wind_velocity and self.hasOrbitalDopplerShift:
                 v_wind = dist_model.calculateLOSVelocity(
                     x_grid, phi_batch, rho_batch, orbphase_batch
                 )  # (n_chords, n_x)
                 v_total_field = v_wind + v_bulk[:, np.newaxis]                  # (n_chords, n_x)
                 shifts_field = const.calculateDopplerShift(-v_total_field)      # (n_chords, n_x)
-                # (n_chords, n_x, n_wav) — same memory footprint as molecular path
-                shifted_wav_field = (shifts_field[:, :, np.newaxis]
-                                     * wavelength[np.newaxis, np.newaxis, :])
             else:
-                shifted_wav_field = None
+                shifts_field = None
 
             # --- density: fully vectorized, returns (n_chords, n_x) ---
             n_tot = dist_model.calculateNumberDensity(
                 x_grid, phi_batch, rho_batch, orbphase_batch
             )  # (n_chords, n_x)
+            n_x_local = n_tot.shape[1]
 
             for constituent in dist_model.constituents:
                 if constituent.isMolecule:
+                    # --- Optimizations 2 + 4: decomposed P-T interpolation ---
+                    # 1) bilinear-interpolate over (P, T) per x-step on native wav grid
+                    # 2) accumulate the weighted column on the native grid
+                    # 3) 1-D interpolate the result onto the Doppler-shifted grid
                     P = n_tot * const.k_B * dist_model.T                        # (n_chords, n_x)
-                    sigma = constituent.getSigmaAbs(P, dist_model.T, shifted_wav)  # (n_chords, n_x, n_wav)
+                    P_clamped = np.clip(P, 1e-4, None)
                     n_abs = n_tot * constituent.chi                              # (n_chords, n_x)
-                    total_tau += np.einsum('cx,cxw->cw', n_abs, sigma) * delta_x
+
+                    n_wav_native = len(constituent.wav_grid)
+                    sigma_eff = np.zeros((n_chords, n_wav_native))
+
+                    for xi in range(n_x_local):
+                        sigma_xi = _bilinear_PT_interp(
+                            P_clamped[:, xi], dist_model.T,
+                            constituent.P_grid, constituent.T_grid,
+                            constituent.sigma_grid_log, constituent.lookupOffset
+                        )                                                        # (n_chords, n_wav_native)
+                        sigma_eff += n_abs[:, xi, np.newaxis] * sigma_xi
+
+                    sigma_eff *= delta_x
+                    total_tau += n_interp_linear_rows(
+                        shifted_wav, constituent.wav_grid, sigma_eff)
 
                 elif getattr(constituent, 'isScatterer', False):
                     # Continuum scattering: cross-section wavelength-only, no Doppler
@@ -1503,12 +1679,16 @@ class Atmosphere:
                     total_tau += col_density[:, np.newaxis] * sigma[np.newaxis, :]
 
                 else:  # atoms
-                    if shifted_wav_field is not None:
-                        # Per-x Doppler shift for wind models.
-                        # n_interp_log accepts arbitrary shapes, so (n_chords, n_x, n_wav) works.
-                        sigma = constituent.getSigmaAbs(shifted_wav_field)      # (n_chords, n_x, n_wav)
+                    if shifts_field is not None:
+                        # --- Optimization 3: per-x loop for wind models ---
+                        # Instead of materializing the full (C, X, W) shifted
+                        # wavelength tensor, iterate over the x-axis and expand
+                        # only a (C, W) slice at a time.
                         n_abs = n_tot * constituent.chi                          # (n_chords, n_x)
-                        total_tau += np.einsum('cx,cxw->cw', n_abs, sigma) * delta_x
+                        for xi in range(n_x_local):
+                            wav_xi = shifts_field[:, xi, np.newaxis] * wavelength[np.newaxis, :]  # (n_chords, n_wav)
+                            sigma_xi = constituent.getSigmaAbs(wav_xi)           # (n_chords, n_wav)
+                            total_tau += n_abs[:, xi, np.newaxis] * sigma_xi * delta_x
                     else:
                         # Fast path: single bulk Doppler shift per chord
                         col_density = np.sum(n_tot * constituent.chi, axis=1) * delta_x
@@ -1770,18 +1950,11 @@ class Transit:
             for dist in self.atmosphere.densityDistributionList
         )
 
-        # Wind models with a per-line-of-sight velocity field take the
-        # position-dependent atomic Doppler path in getLOSopticalDepth_Batch,
-        # which allocates molecular-scale (n_chords, n_x, n_wav) cross-section
-        # arrays.  The chunk-size estimator must treat that path as "heavy"
-        # (is_molecular=True); otherwise it sizes batches from the cheap
-        # column-density estimate and the per-x tensor blows past the memory
-        # cap, risking a system OOM.
-        has_perx_wind = self.atmosphere.hasOrbitalDopplerShift and any(
-            hasattr(dist, 'calculateLOSVelocity')
-            for dist in self.atmosphere.densityDistributionList
-        )
-        heavy_path = has_molecules or has_perx_wind
+        # With Optimizations 2-4, both the molecular and per-x wind paths
+        # avoid materialising the full (C, X, W) tensor.  Only molecules
+        # still require a moderately larger per-chord allocation (for the
+        # native-wavelength-grid intermediates).
+        heavy_path = has_molecules
 
         x_grid = self.spatialGrid.constructXaxis()
         n_x = len(x_grid)
