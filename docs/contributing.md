@@ -1,215 +1,86 @@
 # Contributing
 
-This guide explains how to extend Prometheus: the repository conventions, how to
-add a new density scenario or opacity source (the two most common extensions),
-how to validate your changes, and the pull-request workflow.
-
-Prometheus is a research code. There is **no automated test suite, linter, or
-CI pipeline in the repository** — validation is done by running the forward
-model and inspecting results. Keep that in mind: the burden of verifying a
-change is on the contributor and the reviewer.
+Prometheus is a research code, and contributions — new density models, additional opacity sources, performance work, and documentation — are welcome. This page describes how to set up a development environment and the conventions the code follows.
 
 ---
 
-## 1. Repository layout recap
+## Development setup
 
-```
-Prometheus/
-├── prometheus.py            # CLI driver / entry point
-├── mainRetrieval.py         # scripted library-usage example
-├── pythonScripts/
-│   ├── constants.py         # cgs constants, Species / AvailableSpecies
-│   ├── celestialBodies.py   # Star, Planet, Moon, AvailablePlanets
-│   ├── geometryHandler.py   # Grid (spatial/temporal discretization)
-│   ├── gasProperties.py     # scenarios, constituents, kernels, Transit
-│   ├── memoryHandler.py     # chord-batch sizing
-│   ├── setup.py             # interactive setup wizard
-│   └── shotNoise.py         # SNR / shot-noise post-processing
-├── Resources/               # line list, planet/star tables, aerosol CSVs
-└── docs/                    # this documentation
+Prometheus has no build step: it is a plain Python package (`pythonScripts`) imported from the repository root. To work on it, clone the repo and install the runtime dependencies into a virtual environment.
+
+```bash
+git clone https://github.com/rgphys/Prometheus.git
+cd Prometheus
+
+python -m venv env
+source env/bin/activate            # Windows: env\Scripts\activate
+
+pip install numpy scipy numba h5py astropy psutil
+# for running the example figure scripts:
+pip install matplotlib pandas
 ```
 
-See [architecture.md](architecture.md) for the object model and data flow, and
-[modules.md](modules.md) for the per-class reference.
+The package is imported as `pythonScripts.*` (see [getting-started.md](getting-started.md#installation)). Run your scripts from the repository root, or prepend the repo root to `sys.path`, so that `import pythonScripts.gasProperties` resolves. The physics data in `Resources/` is located relative to the package automatically — no configuration is required.
 
 ---
 
-## 2. Code style
+## Running the examples
 
-The code base does not enforce a formatter, but follow the conventions already
-present so diffs stay readable:
+The `fig*.py` scripts at the repository root are the de-facto integration tests: each builds a full simulation programmatically and exercises a different code path (atomic lines, molecular bands, tori, escaping winds, light curves). Running one end-to-end is the quickest way to confirm a change has not broken anything.
 
-- **Units are cgs everywhere internally.** Convert user-facing units (Å, bar,
-  km/s, planetary/solar/Jovian radii) only at the boundary — the setup wizard
-  (`setup.py`) and the parsing in `prometheus.py`. Never let a non-cgs value
-  reach a physics method.
-- **Naming.** Classes use `CamelCase` (`HydrostaticAtmosphere`), methods and
-  functions use `camelCase` (`calculateNumberDensity`, `getLOSopticalDepth_Batch`)
-  to match the existing surface. Numba kernels are prefixed with `n_` or `_`
-  (`n_interp_log`, `_bilinear_PT_interp`).
-- **Vectorize, don't loop over chords.** The hot path operates on batched arrays
-  of shape `(n_chords, n_x)` / `(n_chords, n_wav)`. New density or velocity
-  methods must accept batched `phi/rho/orbphase` and broadcast against `x`, the
-  same way `Planet.getDistanceFromPlanet` does. A per-chord Python loop on the
-  optical-depth path is a regression.
-- **Keep cgs constants in `constants.py`.** Don't hard-code physical constants
-  inline.
-- Docstrings are short and describe the physics / shape contract of the return
-  value, not the implementation line by line.
+```bash
+python fig1_model_zoo.py
+python fig8_molecular_jwst-8.py
+```
+
+Some figures (`fig2`, `fig4`, `fig9`, `fig10`, `fig11`) additionally depend on the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository; the Prometheus-only figures (`fig1`, `fig3`, `fig6`, `fig7`, `fig8`) run against `pythonScripts.*` alone.
+
+When you add a feature, the lightest-weight check is to build a small simulation directly from Python objects — a single planet, one density model, a narrow `WavelengthGrid`, and a coarse `Grid` — and confirm `Transit.sumOverChords` returns a sensible spectrum. Keep `max_memory_gb` small (e.g. `0.1–0.5`) for quick iterations.
 
 ---
 
-## 3. Adding a new density scenario
+## Code style and conventions
 
-A scenario is a number-density model. Decide which family it belongs to:
-
-- **Collisional** (`CollisionalAtmosphere` base): carries `T` and `P_0`, density
-  normalized by `n_0 = P_0/(k_B T)`. Supports continuum scattering with
-  cloud-top pressure confinement.
-- **Evaporative** (`EvaporativeExosphere` base): normalized by a particle number
-  `N` or by mass continuity. Allows exactly one atomic/molecular absorber plus
-  any number of scattering sources.
-
-Then, in `pythonScripts/gasProperties.py`:
-
-1. **Subclass the right base** and implement
-   `calculateNumberDensity(self, x, phi, rho, orbphase)` returning an array of
-   shape `(n_chords, n_x)` (and `(n_x,)` for scalar chord input). Use the
-   batched distance helpers on `Planet` / `Moon`
-   (`getDistanceFromPlanet`, `getDistanceFromMoon`, `getTorusCoords`) so
-   broadcasting is handled for you.
-2. **(Optional) position-dependent Doppler.** If the scenario has a bulk LOS
-   velocity field that varies along `x` (like the radial wind), implement
-   `calculateLOSVelocity(x_grid, phi_batch, rho_batch, orbphase_batch)`
-   returning `(n_chords, n_x)`. The kernel will detect it and take the wind path
-   (per-cell wavelength shift). Without it, the scenario uses only the per-chord
-   bulk shift from the planet/moon.
-3. **Wire up parsing** in `prometheus.py`: add a branch that recognizes the new
-   scenario key in `Scenarios` and constructs your class with the parsed
-   parameters. Convert units here.
-4. **Wire up the wizard** in `setup.py`: add a `setupScenario` option and the
-   numeric questions (with bounds and unit conversion) for its parameters so
-   `setup` can produce a valid setup file.
-5. **Document it**: add a row to the scenario tables in
-   [architecture.md §2](architecture.md#2-object-model) and
-   [modules.md](modules.md#gaspropertiespy), and the JSON example in
-   [api.md](api.md#scenarios).
+- **Units are cgs everywhere.** Wavelengths in cm, pressures in barye, lengths in cm, velocities in cm/s, masses in g, temperatures in K. Mean molecular weight is a mass in grams (a multiple of `const.amu`). Keep new code in cgs and convert only at the presentation layer.
+- **The API is programmatic.** A simulation is assembled from constructed Python objects — there is no configuration-file layer or command-line interface, and contributions should preserve that. New functionality should be exposed as classes/methods that compose with `Atmosphere` and `Transit`.
+- **Stay vectorized.** The optical-depth kernel is fully vectorized over chords (no Python loop over individual lines of sight), and the hot interpolation paths are Numba `@njit(parallel=True, fastmath=True)` kernels. New density models implement a vectorized `calculateNumberDensity` that accepts batched `(n_chords,)` / `(n_chords, n_x)` inputs; avoid materializing the full `(chord, x, wavelength)` tensor.
+- **Respect the memory budget.** Heavy allocations should flow through the memory-aware batching in `memoryHandler.py` rather than assuming all chords fit in RAM at once. If a new path changes per-chord memory, update `estimate_chord_memory` accordingly.
+- **Match the surrounding style.** Follow the naming and structure already present in the module you are editing (e.g. `gasProperties.py`). Keep public constructor argument names stable, since they are part of the documented API.
 
 ---
 
-## 4. Adding a new opacity source
+## Adding a new density model
 
-There are three constituent kinds. Pick the one that matches.
+A density model holds a reference to its `Planet` (or `Moon`) and exposes a vectorized number-density method that the optical-depth kernel calls. To add one:
 
-### Atomic / ionic line absorber
-Add the species to `AvailableSpecies` in `constants.py` (name, element,
-ionization stage, mass in g) and make sure `Resources/LineList.txt` contains its
-lines (use `Resources/astroquery_retrieval.py` to pull and filter NIST lines).
-No new class is needed — `AtmosphericConstituent` handles any species in the
-list.
+1. Subclass the appropriate base (`CollisionalAtmosphere` for mixing-ratio constituents, `EvaporativeExosphere` for `N`-normalized single-constituent models) so it inherits the constituent-adding API.
+2. Implement the vectorized `calculateNumberDensity` for your profile.
+3. If the model carries kinematics (like an escaping wind), expose `calculateLOSVelocity` so the kernel applies a position-dependent Doppler shift when `hasOrbitalDopplerShift=True`.
+4. Confirm it composes inside `Atmosphere([...])` alongside the existing models and runs through `Transit.sumOverChords`.
 
-### Molecule
-No code change is required to support a new molecule — supply its cross-section
-table as `Resources/molecularResources/<MoleculeName>.h5` with datasets `p`,
-`t`, `bin_edges`, and `xsecarr` (log-σ on a `(P, T, λ)` grid). Any species key
-that is neither in `AvailableSpecies` nor in `SCATTERER_TYPES` is dispatched to
-`MolecularConstituent`, which slices the table to the simulation window.
-
-### Continuum scattering / aerosol
-1. Subclass `ScatteringConstituent` in `gasProperties.py` and implement
-   `calculateSigmaAbs(self, wavelength)` returning `σ(λ)` in cm² (wavelength-only;
-   no Doppler shift is applied to continuum sources).
-2. Register the key in `SCATTERER_TYPES` and add a case to
-   `makeScatteringConstituent(scattererType, paramsDict)`.
-3. If it should honor cloud-top confinement, accept a `P_top` argument (only
-   meaningful on collisional hosts — it is ignored in evaporative contexts where
-   no pressure is defined).
-4. Add a `setup*` helper in `setup.py` and a parsing branch in `prometheus.py`,
-   then document the parameters in [api.md](api.md#species) and the table in
-   [architecture.md §2](architecture.md#constituent-classes-opacity-sources).
+See [architecture.md](architecture.md) for the object model and the optical-depth kernel, and [api-reference.md](api-reference.md) for the existing constructor signatures to mirror.
 
 ---
 
-## 5. Validating a change
+## Adding physics data
 
-Because there is no test suite, validate empirically:
-
-1. **Smoke-run the forward model.** Build a minimal setup file (or use
-   `mainRetrieval.py`) and run
-
-   ```bash
-   python prometheus.py <name> --max-memory 2.0
-   ```
-
-   Confirm it completes and the printed max/min flux decrease is physically
-   sane (e.g. `R ≤ 1`, absorption deepest near line centers).
-
-2. **Check the single-chord path.** `Transit.evaluateChord(phi, rho, orbphase)`
-   returns `(F_in, F_out)` and is the cheapest way to sanity-check a new
-   scenario or constituent in isolation:
-
-   ```python
-   F_in, F_out = transit.evaluateChord(phi=0.0, rho=0.5 * star.R, orbphase=0.0)
-   print(F_in / F_out)        # transmission for this chord
-   ```
-
-3. **Cross-check batched vs. single-chord.** A batched `sumOverChords` result
-   must be consistent with summing `evaluateChord` over the same grid — this is
-   the main correctness invariant when touching the kernel.
-
-4. **Watch memory.** If you add intermediates on the optical-depth path, update
-   `memoryHandler.estimate_chord_memory` so batch sizing still keeps peak RAM
-   under `--max-memory`. Materializing a `(n_chords, n_x, n_wav)` tensor is the
-   classic way to blow the budget — the kernel deliberately avoids it.
-
-5. **Conservation checks.** For the radial wind, number density should follow
-   mass continuity `n(r) = Mdot/(4π r² v(r) μ)`; verify a new velocity law gives
-   a finite, positive density across `[r_inner, r_outer]`.
+- **Atomic / ionic lines** come from `Resources/LineList.txt` (element, ionization state, vacuum wavelength, Aₖᵢ, fᵢₖ); a new species also needs an entry in the `AvailableSpecies` catalog in `constants.py` (mass and ionization state).
+- **Molecular cross sections** are one HDF5 file per molecule in `Resources/molecularResources/<name>.h5`, tabulated on a `(pressure, temperature, wavelength)` grid; the filename must match the name passed to `addMolecularConstituent`.
+- **Planets / stars** are rows in `Resources/planets.csv` / `Resources/stars.csv`, read by `AvailablePlanets`.
 
 ---
 
-## 6. Branching and commits
+## Submitting changes
 
-- Branch off `main` with a short descriptive name
-  (`feature/parker-wind`, `fix/clv-edge`, `docs/api-schema`).
-- Keep commits focused; write imperative, descriptive messages
-  (the existing history uses messages like
-  *"Enhance memory estimation, add radial wind parameters, …"*).
-- Do not commit large binaries. Molecular `.h5` tables, PHOENIX FITS files, and
-  the `phoenix_cache/` directory are intentionally **not** tracked (see
-  `.gitignore`); ship instructions for obtaining them instead of the files.
-- Do not commit `__pycache__/`, virtual environments, or `output/` artifacts.
+1. Branch from `main`.
+2. Make your change, and verify at least one relevant `fig*.py` (or a small programmatic script) still produces a sensible spectrum.
+3. Keep commits focused and write a clear message describing the physics or behavior that changed.
+4. Open a pull request against `rgphys/Prometheus` describing the motivation, the approach, and how you validated it.
 
 ---
 
-## 7. Pull-request process
+## Where to go next
 
-1. Push your branch and open a PR against `main`.
-2. In the description, state:
-   - **what** physics/behavior changed and **why**,
-   - the **setup file or script** you used to validate it (so a reviewer can
-     reproduce),
-   - a before/after of the relevant spectrum or light curve when the change
-     affects results,
-   - any change to memory characteristics or run time on the hot path.
-3. Note any new dependency explicitly — the dependency list lives in
-   [getting-started.md](getting-started.md#1-requirements), not in a packaged
-   `requirements.txt` in the repo, so additions must be called out.
-4. Because there is no CI, the reviewer reproduces your validation run. Make that
-   easy: include the exact command and any small input files.
-
----
-
-## 8. Where things live (quick map for contributors)
-
-| If you want to change… | Edit |
-|---|---|
-| A physical constant or supported atom/ion | `pythonScripts/constants.py` |
-| Star / planet / moon geometry or stellar treatment | `pythonScripts/celestialBodies.py` |
-| The spatial / phase grid | `pythonScripts/geometryHandler.py` |
-| A density scenario, opacity source, or the kernel | `pythonScripts/gasProperties.py` |
-| Chord-batch memory sizing | `pythonScripts/memoryHandler.py` |
-| The interactive setup wizard | `pythonScripts/setup.py` |
-| Shot-noise post-processing | `pythonScripts/shotNoise.py` |
-| Setup-file parsing / the CLI | `prometheus.py` |
-| Planet/star tables or the line list | `Resources/` |
+- **[architecture.md](architecture.md)** — how the modules fit together and how a spectrum is computed.
+- **[api-reference.md](api-reference.md)** — constructor signatures and methods.
+- **[examples.md](examples.md)** — runnable end-to-end scripts.
