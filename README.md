@@ -89,21 +89,18 @@ Results are saved to `../output/<setup_name>.txt` with the format:
 
 ```
 Prometheus/
-├── prometheus.py          # Main entry point
-├── mainRetrieval.py       # Retrieval utilities
-├── test_smoke.py          # Smoke tests (no network, flat star)
-├── pythonScripts/
-│   ├── setup.py           # Interactive setup file generator
-│   ├── gasProperties.py   # Atmosphere/exosphere models, scattering, transit computation
-│   ├── celestialBodies.py # Planet & moon definitions
-│   ├── geometryHandler.py # Spatial grid and chord geometry
-│   ├── memoryHandler.py   # Memory-aware chunk processing
-│   └── constants.py       # Physical constants & available species
-├── Resources/             # Cross-section and species data
-│   ├── molecularResources/ # HDF5 molecular cross-sections
-│   ├── aerosols/           # Precomputed aerosol Mie extinction tables
-│   └── optical_constants/  # Published optical constants
-└── docs/                  # Documentation
+├ pythonScripts/
+│   ├ setup.py           # Interactive setup file generator
+│   ├ gasProperties.py   # Atmosphere/exosphere models, scattering, transit computation
+│   ├ celestialBodies.py # Planet & moon definitions
+│   ├ geometryHandler.py # Spatial grid and chord geometry
+│   ├ memoryHandler.py   # Memory-aware chunk processing
+│   └ constants.py       # Physical constants & available species
+├ Resources/             # Cross-section and species data
+│   ├ molecularResources/ # HDF5 molecular cross-sections
+│   ├ aerosols/           # Precomputed aerosol Mie extinction tables
+│   └ optical_constants/  # Published optical constants
+└ docs/                  # Documentation
 ```
 
 Setup files are stored in `../setupFiles/` (gitignored) and outputs in `../output/`.

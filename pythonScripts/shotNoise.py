@@ -48,9 +48,7 @@ from typing import Optional
 import numpy as np
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # SNR Scaling Law
-# ──────────────────────────────────────────────────────────────────────────────
 def scale_snr(baseline_snr: float,
               baseline_mag: float,
               baseline_time_hrs: float,
@@ -91,9 +89,7 @@ def scale_snr(baseline_snr: float,
     return baseline_snr * math.sqrt(flux_ratio) * math.sqrt(time_ratio)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # SNR Model
-# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class TransitParams:
     """Observing parameters needed by the SNR scaling law.
@@ -144,7 +140,7 @@ class SNRModel:
     _baseline_time_hrs: Optional[float] = None
     transit_params: Optional[TransitParams] = None
 
-    # ── Constructors ─────────────────────────────────────────────────────
+    #  Constructors 
 
     @classmethod
     def constant(cls, snr_per_bin: float) -> "SNRModel":
@@ -289,7 +285,7 @@ class SNRModel:
             _snr_arr=np.array(snr)[idx],
         )
 
-    # ── Evaluation ───────────────────────────────────────────────────────
+    #  Evaluation 
 
     def snr_at(self, wavelength_nm: float) -> float:
         """Return the SNR per bin at a single wavelength.
@@ -346,9 +342,7 @@ class SNRModel:
         return baseline_snr * math.sqrt(flux_ratio) * math.sqrt(time_ratio)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Noise Application
-# ──────────────────────────────────────────────────────────────────────────────
 def sigma_from_snr(snr: float | np.ndarray) -> np.ndarray:
     """Convert SNR to 1-sigma fractional noise level.
 

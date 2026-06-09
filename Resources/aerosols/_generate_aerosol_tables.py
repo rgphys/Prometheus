@@ -49,7 +49,7 @@ UM_TO_CM = 1e-4            # 1 um in cm
 CM2_PER_UM2 = UM_TO_CM ** 2   # um^2 -> cm^2
 
 
-# ── refractive-index loaders (one per native file format) ─────────────────────
+#  refractive-index loaders (one per native file format) 
 def _read_lines(path):
     """Read a possibly latin-1 / CRLF text file as a list of clean lines."""
     with open(path, encoding='latin-1') as f:
@@ -153,7 +153,7 @@ def load_ch4(path):
     return a[idx, 0], a[idx, 1], a[idx, 2]
 
 
-# ── Mie integration over a log-normal size distribution ───────────────────────
+#  Mie integration over a log-normal size distribution 
 def mie_sigma_ext(n_lam, k_lam, r_eff_um, sigma_g=1.6, n_r=40):
     """Per-particle extinction cross-section [cm^2] vs the output grid.
 
