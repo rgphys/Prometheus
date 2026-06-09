@@ -1,310 +1,147 @@
 # Architecture
 
-This document describes how Prometheus is structured internally: the coordinate
-system and geometry, the object model, the data flow from setup file to output,
-the vectorized optical-depth kernel that does the heavy lifting, and the
-key design decisions and their trade-offs.
-
-All quantities are in **cgs units** internally. User-facing units (Å, bar,
-km/s, Jovian/solar/Io radii, …) are converted at the setup boundary.
+This page describes how Prometheus is organized and how a transmission spectrum is computed, from the planet object through to the final flux ratio.
 
 ---
 
-## 1. Geometry and coordinate system
+## Modules
 
-Prometheus ray-traces the stellar disk. The coordinate frame
-(defined in `geometryHandler.Grid`) is:
+All code lives in the `pythonScripts` package:
 
-- The **observer** sits at `x = −∞`.
-- The **star** is centered at the origin `(0, 0, 0)`.
-- The **x-axis** is the line of sight, pointing from the observer through the
-  star.
-- The **y–z plane** is the plane of the sky.
-- A sky-plane point is described in polar coordinates `(rho, phi)`:
-  `y = rho·sin(phi)`, `z = rho·cos(phi)`.
-
-A **chord** is a single line of sight: a fixed `(rho, phi)` and orbital phase,
-integrated along `x`. The full simulation evaluates a Cartesian product of
-`phi × rho × orbital phase`, flattened by `Grid.getChordGrid()` into an
-`(N_chord, 3)` array of `(phi, rho, orbphase)` rows.
-
-### The four discretization axes
-
-| Axis | Meaning | Built by | Step counts |
-|---|---|---|---|
-| `x` | line-of-sight integration coordinate | `constructXaxis` | `x_steps`, half-length `x_border`, centered on `x_midpoint` (= planet semi-major axis `a`) |
-| `rho` | sky-plane radius (0 → stellar radius) | `constructRhoAxis` | `rho_steps`, upper bound `rho_border` (= `R_star`) |
-| `phi` | sky-plane azimuth (0 → 2π) | `constructPhiAxis` | `phi_steps` |
-| orbphase | orbital phase (−border → +border) | `constructOrbphaseAxis` | `orbphase_steps`, in radians (centered on mid-transit = 0) |
-
-All spatial axes use **cell-midpoint** sampling by default (the integration
-treats each cell as a rectangle of width `delta_x`, `delta_rho`, `delta_phi`).
-
-### Body positions
-
-`celestialBodies.Planet.getPosition(orbphase)` places the planet on a circular,
-edge-on orbit: `x_p = a·cos(orbphase)`, `y_p = a·sin(orbphase)`. The
-line-of-sight velocity is `v_los = −sin(orbphase)·√(G·M_star/a)` (positive =
-receding = redshift). A `Moon` orbits its planet with a period ratio derived
-from Kepler's third law (`getOrbphase`) and adds its orbital velocity to the
-planet's.
-
-`getDistanceFromPlanet`, `getDistanceFromMoon`, and `getTorusCoords` all support
-**batched broadcasting**: given `x` of shape `(n_x,)` and `phi/rho/orbphase` of
-shape `(n_chords,)`, they return arrays of shape `(n_chords, n_x)`. This is the
-backbone of the vectorized density evaluation.
-
----
-
-## 2. Object model
-
-```
-Transit
- ├── Atmosphere
- │    └── densityDistributionList: [ <scenario>, ... ]
- │         each scenario (e.g. HydrostaticAtmosphere, RadialWindExosphere, ...)
- │           ├── planet  (and .moon for moon-sourced scenarios)
- │           └── constituents: [ AtmosphericConstituent | MolecularConstituent | ScatteringConstituent, ... ]
- ├── WavelengthGrid
- └── spatialGrid: geometryHandler.Grid
-       └── planet.hostStar: Star
-```
-
-### Scenario classes (number-density models)
-
-Two families, distinguished by whether they carry a temperature:
-
-**Collisional** (`CollisionalAtmosphere` base, has `T` and `P_0`):
-`BarometricAtmosphere`, `HydrostaticAtmosphere`, `PowerLawAtmosphere`. Density
-is normalized by a reference number density `n_0 = P_0 / (k_B T)`. Only these
-support continuum scattering with cloud-top pressure confinement.
-
-**Evaporative** (`EvaporativeExosphere` base, normalized by particle number `N`
-or by mass continuity): `PowerLawExosphere`, `MoonExosphere`,
-`TidallyHeatedMoon`, `TorusExosphere`, `SerpensExosphere`,
-`RadialWindExosphere`. These represent tenuous exospheres.
-
-Every scenario implements `calculateNumberDensity(x, phi, rho, orbphase)`
-returning `(n_chords, n_x)` (or `(n_x,)` for scalar input). Some also implement
-`calculateLOSVelocity(...)` (only `RadialWindExosphere`) for
-position-dependent Doppler shifts.
-
-### Constituent classes (opacity sources)
-
-| Class | `isMolecule` | `isScatterer` | Cross-section source |
-|---|---|---|---|
-| `AtmosphericConstituent` | False | — | Voigt profiles summed over NIST lines, cached as `log10 σ(λ)` interpolant |
-| `MolecularConstituent` | True | — | HDF5 table `σ(P, T, λ)`, decomposed bilinear-PT + 1-D-λ interpolation |
-| `ScatteringConstituent` (subclasses below) | False | True | Analytic or tabulated `σ(λ)`, no Doppler shift |
-
-Scattering subclasses: `RayleighHaze`, `GrayCloud`, `PowerLawAerosol`,
-`TabulatedAerosol`. The reserved keys are in `SCATTERER_TYPES`.
-
----
-
-## 3. Data flow
-
-### Setup → objects (`prometheus.py`)
-
-1. Load the JSON setup file into `Fundamentals / Scenarios / Architecture /
-   Species / Grids` dictionaries.
-2. `bodies.AvailablePlanets().findPlanet(name)` looks up the planet (and its
-   host star) from `planets.csv` / `stars.csv`.
-3. Build the `WavelengthGrid` and the spatial `Grid`.
-4. For each scenario key, instantiate the matching scenario class.
-5. For each scenario, add its constituents. The dispatch is by key:
-   - name in `AvailableSpecies` → atomic/ionic `AtmosphericConstituent`
-     (collisional gets a mixing ratio `chi`; evaporative gets `sigma_v`),
-   - name in `SCATTERER_TYPES` → `ScatteringConstituent` via
-     `makeScatteringConstituent`,
-   - otherwise → `MolecularConstituent` (collisional uses `chi`; evaporative
-     uses a pseudo-temperature `T`).
-   Each constituent then builds its wavelength-sliced lookup via
-   `addLookupFunctionToConstituent(wavelengthGrid)`.
-6. Wrap the scenarios in an `Atmosphere(scenarioList, DopplerOrbitalMotion)` and
-   then a `Transit`.
-
-### Objects → result (`Transit.sumOverChords`)
-
-1. Flatten the `(phi, rho, orbphase)` chord grid.
-2. Precompute, per chord: CLV factor, stellar-rotation Doppler shift, and the
-   orbital-phase bin index.
-3. Estimate an **optimal batch size** (`memoryHandler.calculate_optimal_chunk_size`)
-   from the RAM budget, the wavelength count, `n_x`, and whether the heavy
-   (molecular) path is active.
-4. For each batch of chords:
-   - Compute the (possibly flat) stellar flux `F_star_batch` and apply CLV.
-   - Determine which chords are **blocked** by the opaque planet/moon disk.
-   - For active (unblocked) chords, call
-     `Atmosphere.getLOSopticalDepth_Batch(...)` to get `τ` of shape
-     `(n_active, n_wav)`.
-   - Apply Beer–Lambert: `F_in = F_out · exp(−τ)`, with `F_out = rho · F_star`.
-   - Accumulate `F_in` and `F_out` into per-orbital-phase sums (the `rho`
-     weighting is the polar-coordinate area element).
-5. Return `R = F_in_sum / F_out_sum` of shape `(n_orbphase, n_wav)`.
-
-`evaluateChord` is a single-chord convenience wrapper around the same kernel,
-used for testing and by retrieval scripts.
-
----
-
-## 4. The optical-depth kernel
-
-`Atmosphere.getLOSopticalDepth_Batch(x_grid, phi_batch, rho_batch,
-orbphase_batch, wavelength, delta_x)` is the computational core. It is **fully
-vectorized — there is no Python loop over individual chords.** It iterates over
-scenarios and, within each scenario, over constituents, accumulating
-`total_tau` of shape `(n_chords, n_wav)`.
-
-For each scenario it computes once:
-- the bulk per-chord LOS velocity `v_bulk` (planet or moon),
-- the per-chord Doppler-shifted wavelength grid `shifted_wav` (`n_chords, n_wav`),
-- for wind models with `calculateLOSVelocity`, the per-(chord, x) total velocity
-  field and its Doppler shift factor `shifts_field` (`n_chords, n_x`),
-- the number density `n_tot` of shape `(n_chords, n_x)`.
-
-Then per constituent, one of three branches runs:
-
-**Atomic / ionic** (`AtmosphericConstituent`):
-- *Fast path* (no wind field): factorize as column density × cross-section.
-  Compute `col_density = Σ_x n·chi·delta_x` per chord, look up the
-  cross-section once per **unique** bulk Doppler shift (cached by a
-  `(shift, wavelength)` key), and broadcast back. This exploits the fact that
-  the cross-section depends only on the per-chord shift, not on `x`.
-- *Wind path* (`shifts_field` present): loop over `x` and, for each step,
-  shift the wavelength grid by that cell's velocity and look up the
-  cross-section — accumulating `n_abs·σ·delta_x`. This applies the
-  position-dependent wind Doppler shift without ever materializing the full
-  `(n_chords, n_x, n_wav)` tensor.
-
-**Molecular** (`MolecularConstituent`):
-- Compute pressure `P = n_tot·k_B·T` (clamped) per `(chord, x)`.
-- Loop over `x`; at each step do a **bilinear interpolation over (P, T)** on the
-  table's native wavelength grid (`_bilinear_PT_interp`, Numba), and accumulate
-  the abundance-weighted column `sigma_eff` on that native grid.
-- After the loop, do a single **1-D interpolation** (`n_interp_linear_rows`,
-  Numba) from the native grid onto the Doppler-shifted wavelength grid.
-- This "decomposed" scheme replaces a full 3-D scattered `RegularGridInterpolator`
-  evaluation over `(n_chords·n_x·n_wav)` points and avoids the `(C, X, W)`
-  tensor.
-
-**Scattering / aerosol** (`ScatteringConstituent`):
-- Cross-section is wavelength-only; no Doppler shift.
-- `col_density = Σ_x n·chi·delta_x` per chord (optionally masked to cells where
-  `P ≥ P_top` for cloud-top confinement, requires a temperature-bearing host).
-- `tau += col_density ⊗ σ(λ)`.
-
-### Numba kernels
-
-| Kernel | Role |
+| Module | Responsibility |
 |---|---|
-| `n_interp_log` | Row-wise 1-D interpolation of `log10 σ(λ)` with a two-pointer O(N+M) scan; returns `10^(log) − offset`. Used for atomic cross-sections and the (flat-or-PHOENIX) stellar flux. Requires monotonic target rows — true for all Doppler-shifted grids. |
-| `n_interp_linear_rows` | Row-wise 1-D interpolation in **linear** space (per-row `y`); maps the molecular `sigma_eff` from native to shifted grid. |
-| `_bilinear_PT_interp` | Bilinear (P, T) interpolation on the molecular log-σ table at fixed `T`, returning σ on the native wavelength grid. |
+| `constants.py` | Physical constants (cgs), `Species`, and `AvailableSpecies` (the atomic/ionic catalog with masses and ionization states). |
+| `celestialBodies.py` | `Star`, `Planet`, `Moon`, and `AvailablePlanets` (loads the planet/star catalog from `Resources/*.csv`). Handles orbital positions, line-of-sight velocities, limb darkening, Rossiter–McLaughlin rotation, and PHOENIX stellar spectra. |
+| `geometryHandler.py` | `Grid` — the spatial/temporal discretization: the line-of-sight axis `x`, the sky-plane polar coordinates `(rho, phi)`, and the orbital-phase axis. |
+| `gasProperties.py` | The bulk of the physics: density models (atmospheres and exospheres), absorber/scatterer constituents, the `Atmosphere` aggregator, the `WavelengthGrid`, the Numba optical-depth kernels, and the `Transit` orchestrator. |
+| `memoryHandler.py` | Memory-aware batching: estimates per-chord memory and picks a chunk size that fits within a RAM budget. |
 
-All three are `@njit(parallel=True, fastmath=True)` and parallelize over rows
-(chords / points) with `prange`.
-
----
-
-## 5. Memory-aware batching
-
-`memoryHandler` sizes chord batches so peak RAM stays under the budget
-(`--max-memory`, default 2 GB; `None` → 50 % of available RAM via `psutil`).
-
-- `estimate_chord_memory(num_wavelengths, n_x, is_molecular)` budgets
-  ~640 bytes/output-wavelength for the molecular path (dominated by
-  native-grid intermediates) and 16 bytes/wavelength for the atomic path, with a
-  2× overhead buffer.
-- `calculate_optimal_chunk_size(...)` divides the available bytes by the
-  per-chord estimate, clamped to `[1, total_chords]`.
-
-When the whole grid fits in one batch, `sumOverChords` reshapes and sums
-directly; otherwise it uses `np.add.at` scatter-adds keyed by the orbital-phase
-bin index.
+The example figure scripts (`fig*.py`) import only from `pythonScripts.*` for the Prometheus physics; some additionally use the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository.
 
 ---
 
-## 6. Spectral lines, wavelength grid, and Doppler shifts
+## Object model and data flow
 
-- **Line list**: `LineList.txt` (tab-separated NIST export) provides element,
-  ionization stage, vacuum wavelength [Å], Einstein `A_ki`, and oscillator
-  strength `f`. `AtmosphericConstituent.getLineParameters` filters lines to the
-  species and wavelength window; the damping parameter is `γ = A_ki / (4π)`.
-- **Voigt profile**: `calculateVoigtProfile` sums
-  `π e²/(m_e c) · f · V(...)` over lines, with Gaussian width set by the thermal
-  velocity dispersion `sigma_v` and Lorentzian width `γ`. It is evaluated on a
-  refined grid (10× finer, 1 % extended) and cached as a `log10 σ` interpolant
-  for speed and to avoid log-of-zero (`lookupOffset = 1e-50`).
-- **Adaptive wavelength grid**: `WavelengthGrid.arangeWavelengthGrid` builds a
-  non-uniform grid — fine resolution (`resolutionHigh`) in `widthHighRes`-wide
-  windows around each line center, coarse (`resolutionLow`) elsewhere. Molecular
-  and scattering opacities are smooth and do not influence grid construction.
-- **Doppler shifts**: the relativistic factor
-  `√((1−β)/(1+β))` (`constants.calculateDopplerShift`) is applied to the
-  wavelength grid. Bulk orbital motion gives one shift per chord; the radial
-  wind additionally gives a per-cell shift via `calculateLOSVelocity`. Stellar
-  rotation (RM) shifts the stellar flux per chord.
+A simulation is built bottom-up from independent objects, then run:
 
----
+```
+                Planet  ──┐  (carries hostStar: Star)
+                          │
+  density model(s) ───────┤   HydrostaticAtmosphere / TorusExosphere /
+   + constituents         │   RadialWindExosphere / ...
+   (atoms, molecules,     │     .addConstituent(...) / .addMolecularConstituent(...)
+    scatterers)           │     .addScatteringConstituent(...)
+                          │     constituent.addLookupFunctionToConstituent(wg)
+                          ▼
+              Atmosphere([models], hasOrbitalDopplerShift)
+                          │
+   WavelengthGrid ────────┤
+   Grid (geometry) ───────┤
+                          ▼
+                       Transit
+                          │  .addWavelength()      → builds Transit.wavelength
+                          │  .sumOverChords(...)    → R(orbphase, wavelength)
+                          ▼
+                  R = Σ F_in / Σ F_out
+```
 
-## 7. Stellar treatment
+The flow:
 
-`celestialBodies.Star`:
-- **Flat star** (default when no spectrum is loaded): `F = 1` everywhere; only
-  the geometric `rho` weighting and CLV apply.
-- **PHOENIX spectrum**: `getSpectrum` rounds `(T_eff, log g, [Fe/H], α)` to the
-  PHOENIX grid, downloads and caches the FITS files, and builds a `log10 F(λ)`
-  interpolant restricted to the simulation's wavelength window (± rotational
-  broadening).
-- **CLV**: quadratic limb darkening `1 − u1·(1−μ) − u2·(1−μ)²`.
-- **RM effect**: surface LOS velocity `v·sin(i)·(rho/R)·cos(phi − phi_rot)`
-  Doppler-shifts the local stellar flux. With rotation off, the integrated
-  stellar flux has a closed form; with rotation on it is summed over the disk.
+1. **Planet → density model.** A density model (e.g. `HydrostaticAtmosphere`) holds a reference to its `Planet` and knows how to return a number density `n(x, phi, rho, orbphase)` at any point.
+2. **Constituents → density model.** Each absorbing/scattering species is attached to a density model. Atomic and molecular constituents must have their opacity lookup precomputed via `addLookupFunctionToConstituent`.
+3. **Density models → `Atmosphere`.** One or more density models are wrapped in an `Atmosphere`, which also carries the global `hasOrbitalDopplerShift` flag and owns the optical-depth computation.
+4. **`WavelengthGrid`.** Stores the sampling parameters. `Transit.addWavelength()` invokes `WavelengthGrid.constructWavelengthGrid`, which scans every atomic line in range and produces a non-uniform grid: fine near lines, coarse elsewhere.
+5. **`Grid`.** Defines the chords. `getChordGrid()` returns the flattened set of `(phi, rho, orbphase)` triples to evaluate.
+6. **`Transit.sumOverChords`.** Batches the chords, computes optical depth per batch, applies Beer–Lambert attenuation against the (optionally PHOENIX) stellar surface flux, and accumulates `F_in`/`F_out` per orbital phase.
 
 ---
 
-## 8. Radial wind details
+## Geometry and coordinate system
 
-`RadialWindExosphere` supports two velocity laws (`wind_model`):
+`geometryHandler.Grid` uses a star-centered frame (defined in its docstring):
 
-- **`'beta'`** — a modified beta law with a finite launch speed:
-  `v(r) = v_base + (v_terminal − v_base)·max(1 − r_inner/r, 0)^beta`. The finite
-  `v_base` (default `v_terminal·1e-3`) removes the density divergence a pure
-  beta law would create at `r_inner` through mass continuity.
-- **`'parker'`** — the exact isothermal Parker-wind transonic solution in closed
-  form via the Lambert-W function. The dimensionless relation
-  `(v/c_s)² − ln[(v/c_s)²] = 4 ln(r/r_c) + 4 r_c/r − 3` is solved as
-  `y = −W_b(−e^{−D})`, selecting the principal branch (subsonic, `r < r_c`) or
-  the `W₋₁` branch (supersonic, `r > r_c`). A trace heavy species can be
-  *advected* by the bulk light gas by passing `wind_mu` (sets the dynamics)
-  separately from `mu` (sets the density normalization).
+- The observer is at `x = −∞`; the star sits at the origin.
+- The `x`-axis is the line of sight through the star's center; the `y`–`z` plane is the sky plane.
+- `rho` is the radial distance from the origin in the sky plane; `phi` is the azimuthal angle.
 
-In both cases the number density follows mass continuity
-`n(r) = Mdot / (4π r² v(r) μ)`, masked to `[r_inner, r_outer]`.
+The integration chord runs along `x`, centered at `x_midpoint` (typically `planet.a`) with half-length `x_border` and `x_steps` cells. The sky-plane sampling spans `rho ∈ [0, rho_border]` (usually out to the stellar radius) with `rho_steps × phi_steps` chords. The orbital-phase axis spans `[−orbphase_border, +orbphase_border]` with `orbphase_steps` points; a single mid-transit spectrum uses `orbphase_border=0, orbphase_steps=1`, while a light curve or phase-resolved map uses many phases.
+
+`getChordGrid()` builds the Cartesian product of these axes into a flat `(N_chords, 3)` array of `(phi, rho, orbphase)`.
 
 ---
 
-## 9. Design decisions and trade-offs
+## The optical-depth kernel
 
-- **Vectorization over multiprocessing.** The hot path uses NumPy broadcasting
-  and Numba JIT kernels, not `multiprocessing`. `import multiprocessing` appears
-  in the codebase but is not used on the active computation path — it is a
-  legacy artifact.
-- **Extinction, not scattering.** All scattering/aerosol sources contribute
-  extinction to the Beer–Lambert optical depth (photons scattered out of the
-  beam are lost). There is **no scattering phase function and no multiple
-  scattering**. Because continuum cross-sections are smooth, no Doppler shift is
-  applied to them.
-- **Decomposed molecular interpolation.** Splitting the 3-D `σ(P, T, λ)` lookup
-  into a per-x bilinear (P, T) step plus a single 1-D λ remap avoids
-  materializing the `(chord, x, wavelength)` tensor and is the dominant speedup
-  for narrow grids (the table is also sliced to the simulation window ± a 1 %
-  Doppler margin).
-- **Caching.** Atomic cross-sections are cached per unique bulk Doppler shift,
-  and the Voigt-profile interpolant is precomputed once per species. The
-  `lookupOffset = 1e-50` lets cross-sections be stored and interpolated in
-  log space without log-of-zero.
-- **Cloud-top confinement is collisional-only.** `P_top` confinement for
-  `GrayCloud` / `PowerLawAerosol` requires a temperature-bearing host scenario;
-  it is ignored in evaporative exosphere contexts (no pressure is defined).
+The heart of the code is `Atmosphere.getLOSopticalDepth_Batch(x_grid, phi_batch, rho_batch, orbphase_batch, wavelength, delta_x)`. It is **fully vectorized over chords** — there is no Python loop over individual lines of sight. It returns optical depth of shape `(n_chords, n_wav)` and is built around three constituent paths.
+
+For each density model in the atmosphere it first computes:
+
+- the per-chord bulk Doppler shift from the planet's (or moon's) orbital line-of-sight velocity, applied to the shared wavelength grid → `shifted_wav` of shape `(n_chords, n_wav)`;
+- for wind models (those exposing `calculateLOSVelocity`), an additional per-cell velocity field `(n_chords, n_x)` that produces a position-dependent Doppler shift;
+- the number density `n_tot` of shape `(n_chords, n_x)` via the model's vectorized `calculateNumberDensity`.
+
+Then, per constituent:
+
+**Atomic / ionic absorbers.**
+The cross section is a sum of Voigt line profiles, precomputed once on a refined grid and stored as a `log10(sigma)` interpolator. In the common case (a single bulk Doppler shift per chord), the column density `Σ n · χ · Δx` is factored out and the cross section is evaluated only on the *unique* shifted grids, with the results cached on the constituent (`_batch_sigma_cache`) — so repeated phases reuse the same cross sections. When a wind velocity field is present, the code instead loops over the `x`-axis and expands only a `(n_chords, n_wav)` slice at a time, so it never materializes the full `(chord, x, wavelength)` tensor.
+
+**Molecular absorbers.**
+Cross sections are tabulated on a `(pressure, temperature, wavelength)` grid read from HDF5. Rather than a single 3-D interpolation over the whole tensor, the molecular path is **decomposed** (this is the main optimization over the original code):
+
+1. For each `x`-cell, a Numba-compiled **bilinear interpolation in `(P, T)`** (`_bilinear_PT_interp`) evaluates the cross section on the molecule's *native* wavelength grid for all chords at once.
+2. The weighted column `Σ_x n·χ·σ` is accumulated on that native grid.
+3. A single Numba 1-D interpolation (`n_interp_linear_rows`) maps the accumulated column from the native grid onto the per-chord Doppler-shifted grid.
+
+This avoids building the `(chord, x, wavelength)` tensor and replaces the expensive `RegularGridInterpolator` call in the inner loop. The native cross-section table is also sliced to the simulation wavelength range (plus a ~1% Doppler margin) at load time, shrinking the per-chord kernel from tens of thousands of wavelength points to `O(N_sim)`.
+
+**Continuum scatterers / aerosols.**
+The extinction cross section depends only on wavelength (no Doppler shift). The column density `Σ n·χ·Δx` is multiplied by `sigma(wavelength)` and added to the optical depth. Cloud-top confinement (`P_top`) zeroes the contribution where the local pressure is below the threshold, for temperature-bearing (collisional) host models.
+
+### The Numba interpolation kernels
+
+Two JIT kernels do the heavy interpolation, both exploiting the fact that Doppler-shifted wavelength grids are monotonic:
+
+- **`n_interp_log(x_targets, x_grid, y_grid_log, offset)`** — interpolates `log10(sigma)` and returns `10**value − offset`. Uses a two-pointer scan that is `O(N + M)` per row instead of a binary search per point, and runs in parallel over rows (`prange`). Used for atomic cross sections and for resampling the PHOENIX stellar spectrum.
+- **`n_interp_linear_rows(x_targets, x_grid, y_grid_2d)`** — row-wise linear interpolation in linear space, used to map the accumulated molecular column onto each chord's shifted grid.
+
+Both are decorated `@njit(parallel=True, fastmath=True)`.
+
+---
+
+## Memory-aware batching
+
+`Transit.sumOverChords` does not evaluate all chords at once. It asks `memoryHandler.calculate_optimal_chunk_size` for a batch size given a RAM budget (`max_memory_gb`):
+
+- `get_available_memory` clamps the requested budget to the actually-available system RAM (via `psutil`); passing `max_memory_gb=None` uses 50% of available RAM.
+- `estimate_chord_memory` estimates bytes per chord. The molecular path is the heavy one (it allocates native-wavelength-grid intermediates per chord, budgeted at ~640 bytes per output wavelength point); the atomic path is light (~16 bytes per wavelength point). A 2× buffer covers Python/NumPy overhead.
+- The chord grid is then processed in slices of that size.
+
+For each batch, the code: resamples the stellar surface flux (flat or PHOENIX, optionally Doppler-shifted by stellar rotation and scaled by limb darkening), masks chords blocked by the opaque planet/moon disk, computes optical depth for the unblocked chords, applies `F_in = F_out · exp(−τ)`, and accumulates `F_in`/`F_out` into per-orbital-phase sums via `np.add.at`. The returned `R = F_in_sum / F_out_sum` has shape `(orbphase_steps, n_wavelength)`.
+
+This keeps peak memory bounded regardless of how finely the spatial and wavelength grids are sampled, which is what makes high-resolution, large-grid runs feasible.
+
+---
+
+## Radial-wind physics
+
+`RadialWindExosphere` models an escaping, radially expanding outflow. The density follows from mass continuity,
+
+```
+n(r) = Mdot / (4π r² v(r) μ),
+```
+
+with two selectable velocity laws (`wind_model`):
+
+- **`'beta'`** — a modified β-law, `v(r) = v_base + (v_terminal − v_base)·max(1 − r_inner/r, 0)^β`. The finite launch speed `v_base` (default `1e-3 · v_terminal`) represents a subsonic wind base and removes the unphysical density divergence a pure β-law produces as `v → 0` at `r_inner`. Setting `β ≈ 1` with `v_terminal` near the sound speed gives a first-order approximation to a thermally driven wind.
+- **`'parker'`** — the **exact isothermal Parker wind** transonic solution, obtained in closed form via the Lambert-W function (`scipy.special.lambertw`). It has no free `β`/`v_terminal` knobs: the profile is fixed by the wind temperature `T` and the planet mass through the sound speed `c_s = sqrt(k_B T / wind_mu)` and the sonic radius `r_c = G M wind_mu / (2 k_B T)`. `Mdot` sets only the density normalization.
+
+A key feature is the **tracer/bulk separation** for the Parker model. A heavy trace species (e.g. Na) does not drive its own transonic wind, so its dynamics are set by the *bulk* light gas: pass `wind_mu` (the mean particle mass of the H/He outflow) to fix the velocity profile, while `mu` (the tracer mass) sets only the continuity normalization. When `wind_mu` is omitted, the dynamics use `mu` (a self-driven wind).
+
+When orbital Doppler shifting is enabled, `RadialWindExosphere.calculateLOSVelocity` is called automatically by the optical-depth kernel to apply a **position-dependent** Doppler shift along each chord. The near (approaching) and far (receding) faces of the outflow produce a blue/red asymmetry and kinematic broadening that a single bulk shift cannot capture — this is the physics exercised in `fig6`.
+
+---
+
+## Where to go next
+
+- **[api-reference.md](api-reference.md)** — exact constructor signatures and methods.
+- **[examples.md](examples.md)** — runnable end-to-end scripts.

@@ -1,143 +1,102 @@
-# Prometheus Documentation
+# Prometheus
 
-**PRO**bing **M**ass loss in **E**xoplanetary **T**ransits with **H**ydrostatic,
-**E**vaporative and **U**ser-defined **S**cenarios.
+**PRO**bing **M**ass loss in **E**xoplanetary **T**ransits with **H**ydrostatic, **E**vaporative, and **U**ser-defined **S**cenarios.
 
-Prometheus is a forward radiative-transfer tool that computes transmission
-spectra and light curves of an object — typically an exoplanet — transiting its
-host star. The code integrates the line-of-sight absorption produced by a
-gaseous medium of arbitrary geometry and returns the wavelength- and
-orbital-phase-resolved transit depth.
+Prometheus is a forward radiative-transfer code for **transmission spectroscopy** of transiting bodies. Given a planet (or moon), a model for how absorbing gas is distributed around it, and a wavelength range, Prometheus computes the wavelength-dependent transit depth — the fraction of stellar flux removed from the beam as starlight passes through the intervening gas.
 
-This `docs/` folder is the reference manual for the code base. It is written for
-a mixed physics / scientific-computing audience: it assumes familiarity with
-exoplanet transit observations and basic radiative transfer, but explains the
-software architecture and APIs in full.
+It is designed for the regime where the absorbing medium is *not* limited to a dense hydrostatic atmosphere: outgassed exomoon clouds, circumplanetary tori, and radially escaping planetary winds are all first-class density models, alongside the canonical barometric/hydrostatic atmosphere.
 
 ---
 
-## What Prometheus does
+## What it computes
 
-Given a description of a star, a transiting body, and a model for the gas around
-that body, Prometheus computes
+For a given orbital phase and wavelength grid, Prometheus integrates the Beer–Lambert optical depth along every line of sight (chord) that crosses the stellar disk, attenuates the local stellar surface flux, and sums over the disk:
 
 ```
-R(orbital phase, wavelength) = F_in / F_out
+R(λ, orbphase) = Σ_chords F_in(λ) / Σ_chords F_out(λ)
 ```
 
-the ratio of the in-transit stellar flux (attenuated by the intervening gas) to
-the out-of-transit flux. `R = 1` means full transmission; `R < 1` means
-absorption. The result is a 2-D grid over orbital phase and wavelength from
-which both **transmission spectra** (fixed phase, varying wavelength) and
-**light curves** (fixed wavelength band, varying phase) can be extracted.
+where `F_out = ρ · F_star` is the unobscured stellar flux for a chord and `F_in = F_out · exp(−τ)` is the transmitted flux. The result `R` is the in-transit/out-of-transit flux ratio; `1 − R` is the excess absorption (transit depth) at each wavelength. Running over an array of orbital phases produces a transit light curve or a phase-resolved transmission map.
 
-The absorbing medium is not restricted to a classical hydrostatic atmosphere.
-Prometheus supports tenuous, non-spherical and dynamically expanding
-distributions that are typical of mass-loss studies:
+The opacity along each chord can combine:
 
-- dense hydrostatic / barometric atmospheres,
-- power-law exospheres,
-- an exomoon-sourced neutral gas cloud,
-- a circumplanetary neutral gas torus,
-- particle distributions imported from the **SERPENS** Monte-Carlo code,
-- a radially expanding wind (parametrized beta-law **or** an exact isothermal
-  Parker-wind solution).
+- **Atomic / ionic line absorption** — Voigt profiles built from NIST line lists (Na I, K I, Fe I, Mg I/II, Ca I/II, Ti I/II, and more).
+- **Molecular band absorption** — pre-computed ExoMOL/HITEMP cross-section tables (functions of pressure, temperature, and wavelength) for species such as H₂O, CO₂, CO, and SO₂.
+- **Continuum scattering / aerosols** — parametrized Rayleigh haze, gray cloud decks, Ångström power-law aerosols, and tabulated Mie cross-sections.
 
-Absorption is computed for atomic and ionic lines (Voigt profiles from NIST
-line lists), molecular bands (pre-computed ExoMOL-style cross-section tables),
-and several continuum scattering / aerosol sources.
+Doppler shifts from the planet's orbital motion (bulk) and from radial-wind kinematics (position-dependent, per line-of-sight cell) are applied to line absorbers, so the code captures the velocity broadening and blue/red asymmetry of escaping atmospheres.
 
 ---
 
-## Why it exists
+## Density models
 
-Atmospheric escape and exospheres leave their fingerprint on high-resolution
-transmission spectra: sodium and potassium doublets, metastable helium, metal
-lines, and broad scattering slopes. Interpreting these signals requires a
-forward model that can:
+| Model | Class | Use case |
+|---|---|---|
+| Barometric atmosphere | `BarometricAtmosphere` | Isothermal exponential profile |
+| Hydrostatic atmosphere | `HydrostaticAtmosphere` | Hydrostatic equilibrium (with Jeans term) |
+| Power-law atmosphere | `PowerLawAtmosphere` | Tenuous power-law profile |
+| Power-law exosphere | `PowerLawExosphere` | Particle-normalized power-law cloud |
+| Moon exosphere | `MoonExosphere` | Outgassed cloud sourced from an orbiting moon |
+| Tidally-heated moon | `TidallyHeatedMoon` | Phase-dependent volcanic source rate |
+| Torus exosphere | `TorusExosphere` | Io-analogue circumplanetary gas torus |
+| SERPENS exosphere | `SerpensExosphere` | Density interpolated from SERPENS particle output |
+| Radial-wind exosphere | `RadialWindExosphere` | Escaping wind (β-law or exact isothermal Parker) |
 
-1. Handle **non-hydrostatic, non-spherical** geometries (clouds, tori, winds)
-   that a 1-D plane-parallel atmosphere code cannot represent.
-2. Resolve **individual spectral lines** with proper Voigt profiles and
-   Doppler shifts from bulk orbital motion and position-dependent wind
-   velocities.
-3. Run fast enough that it can be embedded in retrievals.
-
-Prometheus targets exactly this niche. It originated as a research code in the
-exoplanet group of Andrea Gebek and has since been extended with additional
-scenarios (radial winds), continuum opacity sources (haze, clouds, aerosols),
-vectorized / Numba-accelerated kernels, memory-aware batching, and a
-post-processing shot-noise module.
+Multiple density models can be combined in a single simulation (e.g. a hydrostatic lower atmosphere beneath an escaping wind).
 
 ---
 
-## High-level architecture
+## Who it's for
 
-A run flows through four layers:
+Prometheus is built for exoplanet and planetary-science researchers who need a fast, scriptable forward model for transmission spectra — whether to interpret high-resolution alkali-line observations, fit JWST molecular spectra, or model the kinematic signatures of atmospheric escape and volcanic exomoons.
 
+The API is **fully programmatic**: you build a simulation by constructing Python objects directly — a planet, one or more density models, a wavelength grid, and a spatial grid — and call a method to run it. There is no configuration-file layer and no command-line wizard; everything is a Python object you can introspect, subclass, and embed in a larger pipeline (parameter sweeps, retrievals, MCMC likelihoods).
+
+---
+
+## A minimal run
+
+```python
+import pythonScripts.gasProperties as gasprop
+import pythonScripts.celestialBodies as bodies
+import pythonScripts.geometryHandler as geom
+import pythonScripts.constants as const
+
+planet = bodies.AvailablePlanets().findPlanet('WASP-39b')
+
+wg = gasprop.WavelengthGrid(0.35e-4, 1.0e-4,
+                            widthHighRes=8e-8,
+                            resolutionLow=4e-7, resolutionHigh=1e-9)
+
+atm = gasprop.HydrostaticAtmosphere(T=1100.0, P_0=1e4,
+                                    mu=2.3 * const.amu, planet=planet)
+atm.addConstituent('NaI', 3e-7)
+atm.constituents[-1].addLookupFunctionToConstituent(wg)
+
+s_grid = geom.Grid(x_midpoint=planet.a, x_border=14.0 * planet.R, x_steps=80,
+                   rho_border=planet.hostStar.R, rho_steps=400, phi_steps=20,
+                   orbphase_border=0.0, orbphase_steps=1)
+
+sim = gasprop.Transit(gasprop.Atmosphere([atm], hasOrbitalDopplerShift=False),
+                      wg, s_grid)
+sim.addWavelength()
+R = sim.sumOverChords(max_memory_gb=0.5)[0]
+
+transit_depth_ppm = (1.0 - R) * 1e6   # vs sim.wavelength (cm)
 ```
-            ┌─────────────────────────────────────────────┐
-   setup    │  setup.py  →  JSON setup file (setupFiles/)  │
-            └─────────────────────────────────────────────┘
-                                  │
-            ┌─────────────────────▼───────────────────────┐
-   build    │  prometheus.py  parses JSON, constructs:     │
-            │    • Planet / Star            (celestialBodies)
-            │    • WavelengthGrid, Grid     (gasProperties, geometryHandler)
-            │    • scenario objects + constituents (gasProperties)
-            │    • Atmosphere, Transit      (gasProperties)
-            └─────────────────────┬───────────────────────┘
-                                  │
-            ┌─────────────────────▼───────────────────────┐
-  compute   │  Transit.sumOverChords()                     │
-            │    • chord grid → memory-sized batches       │
-            │    • Atmosphere.getLOSopticalDepth_Batch()   │
-            │    • Beer–Lambert: F_in = F_out · exp(−τ)    │
-            └─────────────────────┬───────────────────────┘
-                                  │
-            ┌─────────────────────▼───────────────────────┐
-  output    │  output/<setup>.txt  (phases + R grid)       │
-            │  optional: shotNoise.py post-processing      │
-            └──────────────────────────────────────────────┘
-```
-
-The geometry is a ray-tracing scheme: the star is at the origin, the observer at
-`x = −∞`, and the sky plane is the `(y, z)` plane parametrized in polar
-coordinates `(rho, phi)`. Each `(rho, phi)` pair defines a **chord** — a line of
-sight through the system — and the code integrates the gas number density along
-`x` for every chord and every orbital phase.
 
 ---
 
 ## Documentation map
 
-| Document | Contents |
-|---|---|
-| [getting-started.md](getting-started.md) | Installation, dependencies, directory layout, first run, output format |
-| [architecture.md](architecture.md) | Coordinate system, data flow, the batched optical-depth kernel, design decisions |
-| [modules.md](modules.md) | Per-module / per-class / per-function reference |
-| [api.md](api.md) | Programmatic API: building a simulation in Python, the setup-file JSON schema, the shot-noise API |
-| [contributing.md](contributing.md) | Branching, code style, adding scenarios/opacity sources, testing, PR process |
-
----
-
-## Quick reference
-
-```bash
-# 1. interactively build a setup file (writes ../setupFiles/<name>.txt)
-python prometheus.py setup
-
-# 2. run the forward model (reads ../setupFiles/<name>.txt,
-#    writes ../output/<name>.txt)
-python prometheus.py <name>
-
-# 3. optional: cap RAM (GB) used by the chord batching
-python prometheus.py <name> --max-memory 4.0
-```
+- **[getting-started.md](getting-started.md)** — installation, dependencies, and a complete first run.
+- **[architecture.md](architecture.md)** — how the modules fit together and how a spectrum is computed (data flow, the Numba optical-depth kernel, memory-aware batching, radial-wind physics).
+- **[api-reference.md](api-reference.md)** — constructor signatures and methods for every public class.
+- **[examples.md](examples.md)** — annotated worked examples: hydrostatic alkali spectrum, molecular JWST spectrum, and an Io-analogue torus.
+- **[contributing.md](contributing.md)** — development setup and code style.
 
 ---
 
 ## License
 
-Prometheus is distributed under the **GNU General Public License v3.0**. See the
-[`LICENSE`](../LICENSE) file at the repository root.
+GPL-3.0. See [LICENSE](../LICENSE).
