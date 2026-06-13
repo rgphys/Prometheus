@@ -69,6 +69,7 @@ class Star:
         self.alpha: float = alpha
         self.CLV_u1: float = 0.
         self.CLV_u2: float = 0.
+        self.CLV_function: Optional[Callable[[Any, Any], Any]] = None
         self.vsiniStarrot: float = 0.
         self.phiStarrot: float = 0.
         self.Fstar_function: Optional[Callable[[Any], Any]] = None
@@ -82,6 +83,24 @@ class Star:
         """
         self.CLV_u1 = CLV_u1
         self.CLV_u2 = CLV_u2
+
+    def addCLVfunction(
+            self, CLV_function: Callable[[Any, Any], Any]) -> None:
+        """Adds a wavelength-dependent center-to-limb variation profile.
+
+        Takes precedence over the quadratic ``addCLVparameters``
+        coefficients in the transit chord sum.  Only the shape in mu (at
+        fixed wavelength) matters: the chord sum normalises per wavelength,
+        so any per-wavelength scaling of the profile cancels.
+
+        Args:
+            CLV_function: Callable ``f(mu, wavelength)`` with ``mu`` an
+                array of cosines of the heliocentric angle, shape (N,),
+                and ``wavelength`` an array in cm, shape (W,).  Must
+                return the relative intensity ``I(mu, wavelength)`` with
+                shape (N, W).
+        """
+        self.CLV_function = CLV_function
 
     def addRMparameters(self, vsiniStarrot: float, phiStarrot: float) -> None:
         """Adds Rossiter-McLaughlin effect parameters to the star.

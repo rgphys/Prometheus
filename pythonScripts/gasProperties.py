@@ -1940,7 +1940,11 @@ class Transit:
 
         star = self.planet.hostStar
         mu_term = np.sqrt(np.clip(1. - rho**2 / star.R**2, 0, 1))
-        clv = 1. - star.CLV_u1 * (1. - mu_term) - star.CLV_u2 * (1. - mu_term)**2
+        if star.CLV_function is None:
+            clv = 1. - star.CLV_u1 * (1. - mu_term) \
+                - star.CLV_u2 * (1. - mu_term)**2
+        else:
+            clv = None  # wavelength-dependent CLV, evaluated per batch
         
         v_star = star.vsiniStarrot * rho / star.R * np.cos(phi - star.phiStarrot)
         star_shifts = const.calculateDopplerShift(v_star)
@@ -1988,7 +1992,11 @@ class Transit:
                 )
             # ------------------------
             
-            F_star_batch *= clv[idx, None]
+            if clv is None:
+                F_star_batch *= star.CLV_function(mu_term[idx],
+                                                  self.wavelength)
+            else:
+                F_star_batch *= clv[idx, None]
 
             y_p = self.planet.a * np.sin(orb[idx])
             is_blocked = (np.sqrt((y[idx] - y_p)**2 + z[idx]**2) < self.planet.R)
