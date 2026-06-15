@@ -762,16 +762,20 @@ class RadialWindExosphere(EvaporativeExosphere):
     The number density follows from mass continuity:
         n(r) = Mdot / (4π r² v(r) μ_particle)
     with the beta-law velocity profile:
-        v(r) = v_terminal * max(1 − r_inner/r, 0)^beta.
+        v(r) = v_terminal * max(1 - r_inner/r, 0)^beta.
 
     Two velocity laws are supported, selected by ``wind_model``:
 
     * ``'beta'`` (default) — a parametrized (beta-law) wind.  Setting beta ≈ 1
       and v_terminal near the local sound speed gives a first-order
-      approximation to a thermally driven Parker wind.
-    * ``'parker'`` — the exact **isothermal Parker wind** transonic solution,
-      obtained in closed form via the Lambert-W function (see
-      :meth:`_wind_velocity_parker`).  This has no free ``beta``/``v_terminal``/
+      approximation to a thermally driven Parker wind.  The beta velocity law
+      v(r) = v_inf (1 - R/r)^beta originates in the line-driven stellar-wind
+      theory of Castor, Abbott & Klein (1975), ApJ 195, 157, and is widely
+      reused as a convenient empirical accelerating-outflow profile for
+      exoplanetary atmospheric escape.
+    * ``'parker'`` — the exact **isothermal Parker wind** transonic solution
+      (Parker 1958, ApJ 128, 664), obtained in closed form via the Lambert-W
+      function (see :meth:`_wind_velocity_parker`).  This has no free ``beta``/``v_terminal``/
       ``v_base`` knobs; the profile is fixed by the wind temperature ``T`` and
       the planet mass, with ``Mdot`` setting only the density normalization.
 
@@ -787,7 +791,7 @@ class RadialWindExosphere(EvaporativeExosphere):
     outflow is launched with a
     finite base speed ``v_base`` at ``r_inner``:
 
-        v(r) = v_base + (v_terminal − v_base) · max(1 − r_inner/r, 0)^beta.
+        v(r) = v_base + (v_terminal - v_base) · max(1 - r_inner/r, 0)^beta.
 
     The finite base velocity represents the (subsonic, ≈ sound-speed) wind
     launch speed of a transonic outflow.  Physically it sets the wind base
@@ -862,7 +866,7 @@ class RadialWindExosphere(EvaporativeExosphere):
         if self.wind_model == 'parker':
             return self._wind_velocity_parker(r)
         # Modified beta-law velocity with a finite base speed:
-        # v(r) = v_base + (v_terminal − v_base) · max(1 − r_inner/r, 0)^beta,
+        # v(r) = v_base + (v_terminal - v_base) · max(1 - r_inner/r, 0)^beta,
         # so v(r_inner) = v_base > 0 and the mass-continuity number density
         # stays finite everywhere in the wind.
         r_safe = np.where(r > 0, r, self.r_inner)
@@ -872,20 +876,36 @@ class RadialWindExosphere(EvaporativeExosphere):
     def _wind_velocity_parker(self, r: np.ndarray) -> np.ndarray:
         """Isothermal Parker-wind speed via the Lambert-W solution [cm/s].
 
+        Isothermal transonic wind of Parker (1958), ApJ 128, 664 — originally
+        the solar-wind solution; the closed-form Lambert-W inversion of the
+        dimensionless wind equation follows Cranmer (2004), Am. J. Phys. 72,
+        1397 (see also Lamers & Cassinelli 1999, "Introduction to Stellar
+        Winds", Ch. 3).
+
+        The same isothermal Parker wind is the standard model for *planetary*
+        atmospheric escape (gravity set by the host planet's GM, not a star):
+        Oklopcic & Hirata (2018), ApJL 855, L11, build an isothermal Parker
+        wind of an exoplanet atmosphere to predict the He 10830 A signal;
+        Lampon et al. (2020), A&A 636, A13, fit such a model to HD 209458 b;
+        and Dos Santos et al. (2022), A&A 659, A62 ("p-winds"), provide an
+        open-source reference implementation of this exact transonic solution.
+        The broader transonic/critical-point planetary-wind picture is
+        Murray-Clay, Chiang & Murray (2009), ApJ 693, 23.
+
         The steady, isothermal, spherically symmetric momentum + continuity
         equations reduce to the dimensionless transonic relation
 
-            (v/c_s)² − ln[(v/c_s)²] = 4 ln(r/r_c) + 4 r_c/r − 3 ≡ D(r),
+            (v/c_s)² - ln[(v/c_s)²] = 4 ln(r/r_c) + 4 r_c/r - 3 ≡ D(r),
 
         with isothermal sound speed c_s = √(k_B T / μ) and sonic radius
-        r_c = G M μ / (2 k_B T).  Writing y = (v/c_s)² this is y − ln y = D,
+        r_c = G M μ / (2 k_B T).  Writing y = (v/c_s)² this is y - ln y = D,
         whose closed form is
 
-            y = −W_b(−e^{−D}),
+            y = -W_b(-e^{-D}),
 
         where W is the Lambert-W function: the principal branch (b = 0) gives
         the subsonic solution for r < r_c, and the W₋₁ branch gives the
-        supersonic solution for r > r_c.  The argument −e^{−D} ∈ [−1/e, 0)
+        supersonic solution for r > r_c.  The argument -e^{-D} ∈ [-1/e, 0)
         because D ≥ 1 (minimum at the sonic point), so the solution is real
         everywhere.
 
@@ -940,13 +960,13 @@ class RadialWindExosphere(EvaporativeExosphere):
         The sign convention matches :meth:`celestialBodies.Planet.getLOSvelocity`:
         the returned value is the velocity component along +x, i.e. **positive
         for gas moving away from the observer (redshift)**, since the observer
-        sits at x = −∞.  This is essential because the result is summed with the
+        sits at x = -∞.  This is essential because the result is summed with the
         bulk orbital velocity ``v_bulk`` (also in the +x convention) inside
         :meth:`Atmosphere.getLOSopticalDepth_Batch` before the Doppler shift is
         applied.  The bulk orbital velocity is NOT included here.
 
         For a radial outflow the gas velocity vector is v_radial · r̂, whose +x
-        component is v_radial · (x − x_p)/r.  Gas behind the planet (x > x_p,
+        component is v_radial · (x - x_p)/r.  Gas behind the planet (x > x_p,
         dx > 0) recedes from the observer (redshift); near-side gas (dx < 0)
         approaches (blueshift).
 
@@ -1248,6 +1268,10 @@ class ScatteringConstituent:
     scattered out of the line of sight are lost from the beam, so the
     extinction cross-section is added directly to the Beer-Lambert optical
     depth — no scattering phase function or multiple scattering is modelled.
+    This single-scattering extinction (= absorption + out-of-beam scattering)
+    treatment is the standard approximation for transit transmission spectra,
+    where the slant geometry makes forward-scattering negligible (e.g.
+    Brown 2001, ApJ 553, 1006; Hubbard et al. 2001, ApJ 560, 413).
 
     Attributes:
         isMolecule (bool): Always False (kept for branch compatibility with the
@@ -1324,6 +1348,15 @@ class RayleighHaze(ScatteringConstituent):
     4 corresponds to pure Rayleigh scattering; smaller values describe
     flatter, more aerosol-like hazes.
 
+    This is the standard exoplanet transmission-spectrum haze parameterization
+    of Lecavelier des Etangs et al. (2008), A&A 481, L83
+    ("Rayleigh scattering in the transit spectrum of HD 189733b"):
+    sigma(lambda) = sigma_0 (lambda/lambda_0)^-4, anchored on the molecular-
+    hydrogen Rayleigh cross-section sigma_0 = 5.31e-27 cm^2 at lambda_0 = 350 nm
+    (3500 A).  A haze is then represented by an enhancement factor (the
+    abundance ``chi``) times this H2 baseline, optionally with a shallower
+    ``slope`` < 4 for aerosol-dominated scattering.
+
     Attributes:
         sigma_ref (float): Reference cross-section at `lambda_ref` [cm^2].
         lambda_ref (float): Reference wavelength [cm].
@@ -1331,15 +1364,20 @@ class RayleighHaze(ScatteringConstituent):
     """
 
     def __init__(self, chi: float = 1.0, sigma_ref: float = 5.31e-27,
-                 lambda_ref: float = 4000e-8, slope: float = 4.0,
+                 lambda_ref: float = 3500e-8, slope: float = 4.0,
                  P_top: Union[float, None] = None):
         """Initializes the RayleighHaze.
 
         Args:
             chi (float): Particle-to-gas abundance ratio. Defaults to 1.0.
             sigma_ref (float): Reference cross-section at `lambda_ref` [cm^2].
-                Defaults to 5.31e-27 (~H2 Rayleigh at 4000 A).
-            lambda_ref (float): Reference wavelength [cm]. Defaults to 4000 A.
+                Defaults to 5.31e-27, the H2 Rayleigh cross-section at 3500 A
+                (Lecavelier des Etangs et al. 2008).  Note this value is tied
+                to lambda_ref = 3500 A; the leading-order Dalgarno & Williams
+                (1962) H2 Rayleigh cross-section is ~3.5e-27 cm^2 at 4000 A.
+            lambda_ref (float): Reference wavelength [cm]. Defaults to 3500 A
+                (350 nm), matching the Lecavelier des Etangs et al. (2008)
+                sigma_ref above.
             slope (float): Power-law exponent. Defaults to 4.0.
             P_top (Optional[float]): Cloud-top pressure [barye]. Defaults to None.
         """
@@ -1401,9 +1439,11 @@ class PowerLawAerosol(ScatteringConstituent):
     """Aerosol with a user-specified Ångström extinction exponent (alpha).
 
     The extinction cross-section follows:
-        σ(λ) = σ_ref × (λ / λ_ref)^(−alpha)
+        σ(λ) = σ_ref × (λ / λ_ref)^(-alpha)
 
-    This is the standard Ångström aerosol parameterization.  alpha = 4
+    This is the standard Ångström (1929, Geogr. Ann. 11, 156) aerosol
+    parameterization, in which aerosol optical thickness varies as
+    lambda^(-alpha) with the Ångström exponent alpha.  alpha = 4
     recovers pure Rayleigh scattering; typical tropospheric aerosols have
     alpha ≈ 1–2; values < 1 approach the gray (wavelength-independent) limit.
 
@@ -1493,10 +1533,12 @@ def makeScatteringConstituent(scattererType: str, paramsDict: dict) -> Scatterin
     chi = paramsDict.get('chi', 1.0)
     P_top = paramsDict.get('P_top', None)
     if scattererType == 'RayleighHaze':
+        # Lecavelier des Etangs et al. (2008) H2 baseline: sigma_0 = 5.31e-27 cm^2
+        # at lambda_0 = 3500 A.  Keep sigma_ref and lambda_ref consistent.
         return RayleighHaze(
             chi=chi,
             sigma_ref=paramsDict.get('sigma_ref', 5.31e-27),
-            lambda_ref=paramsDict.get('lambda_ref', 4000e-8),
+            lambda_ref=paramsDict.get('lambda_ref', 3500e-8),
             slope=paramsDict.get('slope', 4.0),
             P_top=P_top,
         )
@@ -1612,7 +1654,7 @@ class Atmosphere:
         for dist_model in self.densityDistributionList:
             has_wind_velocity = hasattr(dist_model, 'calculateLOSVelocity')
 
-            # --- bulk orbital velocity (one value per chord) ---
+            #  bulk orbital velocity (one value per chord) 
             if self.hasOrbitalDopplerShift:
                 if not dist_model.hasMoon:
                     v_bulk = dist_model.planet.getLOSvelocity(orbphase_batch)  # (n_chords,)
@@ -1624,7 +1666,7 @@ class Atmosphere:
             shifts = const.calculateDopplerShift(-v_bulk)                       # (n_chords,)
             shifted_wav = shifts[:, np.newaxis] * wavelength[np.newaxis, :]    # (n_chords, n_wav)
 
-            # --- per-x velocity field for wind models ---
+            #  per-x velocity field for wind models 
             # Compute only the (n_chords, n_x) shift factors, NOT the full
             # (n_chords, n_x, n_wav) tensor — the expansion is done lazily
             # inside the per-x loop (Optimization 3).
@@ -1637,7 +1679,7 @@ class Atmosphere:
             else:
                 shifts_field = None
 
-            # --- density: fully vectorized, returns (n_chords, n_x) ---
+            #  density: fully vectorized, returns (n_chords, n_x) 
             n_tot = dist_model.calculateNumberDensity(
                 x_grid, phi_batch, rho_batch, orbphase_batch
             )  # (n_chords, n_x)
@@ -1645,7 +1687,7 @@ class Atmosphere:
 
             for constituent in dist_model.constituents:
                 if constituent.isMolecule:
-                    # --- Optimizations 2 + 4: decomposed P-T interpolation ---
+                    #  Optimizations 2 + 4: decomposed P-T interpolation 
                     # 1) bilinear-interpolate over (P, T) per x-step on native wav grid
                     # 2) accumulate the weighted column on the native grid
                     # 3) 1-D interpolate the result onto the Doppler-shifted grid
@@ -1680,7 +1722,7 @@ class Atmosphere:
 
                 else:  # atoms
                     if shifts_field is not None:
-                        # --- Optimization 3: per-x loop for wind models ---
+                        #  Optimization 3: per-x loop for wind models 
                         # Instead of materializing the full (C, X, W) shifted
                         # wavelength tensor, iterate over the x-axis and expand
                         # only a (C, W) slice at a time.
@@ -1978,7 +2020,7 @@ class Transit:
         for i in range(0, len(chordGrid), batch_size):
             idx = slice(i, i + batch_size)
             
-            # --- MODIFIED SECTION ---
+            #  MODIFIED SECTION 
             # If no spectrum is loaded, assume a flat star (flux = 1.0)
             if star.Fstar_function is None:
                 F_star_batch = np.ones((len(phi[idx]), n_wav))
@@ -1990,7 +2032,7 @@ class Transit:
                     star.Fstar_function.y, 
                     0.0
                 )
-            # ------------------------
+            # 
             
             if clv is None:
                 F_star_batch *= star.CLV_function(mu_term[idx],

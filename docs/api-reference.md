@@ -273,7 +273,7 @@ The orchestrator. `atmosphere` is an `Atmosphere`, `wavelengthGrid` a `Wavelengt
 | Method | Purpose |
 |---|---|
 | `addWavelength()` | Build and store `Transit.wavelength` (cm) from the atomic line list and grid parameters. Call before `sumOverChords`. |
-| `sumOverChords(max_memory_gb=2.0) -> np.ndarray` | Run the simulation. Returns `R` of shape `(orbphase_steps, n_wavelength)`. `R[i]` is the flux ratio at orbital phase `i`; `1 − R[i]` is the transit depth. |
+| `sumOverChords(max_memory_gb=2.0) -> np.ndarray` | Run the simulation. Returns `R` of shape `(orbphase_steps, n_wavelength)`. `R[i]` is the flux ratio at orbital phase `i`; `1 - R[i]` is the transit depth. |
 | `evaluateChord(phi, rho, orbphase)` | Lower-level single-chord evaluation returning `(F_in, F_out)`. |
 | `checkBlock(phi, rho, orbphase)` | Whether a chord is blocked by the opaque planet/moon disk. |
 

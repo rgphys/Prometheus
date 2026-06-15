@@ -60,11 +60,11 @@ The flow:
 
 `geometryHandler.Grid` uses a star-centered frame (defined in its docstring):
 
-- The observer is at `x = −∞`; the star sits at the origin.
+- The observer is at `x = -∞`; the star sits at the origin.
 - The `x`-axis is the line of sight through the star's center; the `y`–`z` plane is the sky plane.
 - `rho` is the radial distance from the origin in the sky plane; `phi` is the azimuthal angle.
 
-The integration chord runs along `x`, centered at `x_midpoint` (typically `planet.a`) with half-length `x_border` and `x_steps` cells. The sky-plane sampling spans `rho ∈ [0, rho_border]` (usually out to the stellar radius) with `rho_steps × phi_steps` chords. The orbital-phase axis spans `[−orbphase_border, +orbphase_border]` with `orbphase_steps` points; a single mid-transit spectrum uses `orbphase_border=0, orbphase_steps=1`, while a light curve or phase-resolved map uses many phases.
+The integration chord runs along `x`, centered at `x_midpoint` (typically `planet.a`) with half-length `x_border` and `x_steps` cells. The sky-plane sampling spans `rho ∈ [0, rho_border]` (usually out to the stellar radius) with `rho_steps × phi_steps` chords. The orbital-phase axis spans `[-orbphase_border, +orbphase_border]` with `orbphase_steps` points; a single mid-transit spectrum uses `orbphase_border=0, orbphase_steps=1`, while a light curve or phase-resolved map uses many phases.
 
 `getChordGrid()` builds the Cartesian product of these axes into a flat `(N_chords, 3)` array of `(phi, rho, orbphase)`.
 
@@ -101,7 +101,7 @@ The extinction cross section depends only on wavelength (no Doppler shift). The 
 
 Two JIT kernels do the heavy interpolation, both exploiting the fact that Doppler-shifted wavelength grids are monotonic:
 
-- **`n_interp_log(x_targets, x_grid, y_grid_log, offset)`** — interpolates `log10(sigma)` and returns `10**value − offset`. Uses a two-pointer scan that is `O(N + M)` per row instead of a binary search per point, and runs in parallel over rows (`prange`). Used for atomic cross sections and for resampling the PHOENIX stellar spectrum.
+- **`n_interp_log(x_targets, x_grid, y_grid_log, offset)`** — interpolates `log10(sigma)` and returns `10**value - offset`. Uses a two-pointer scan that is `O(N + M)` per row instead of a binary search per point, and runs in parallel over rows (`prange`). Used for atomic cross sections and for resampling the PHOENIX stellar spectrum.
 - **`n_interp_linear_rows(x_targets, x_grid, y_grid_2d)`** — row-wise linear interpolation in linear space, used to map the accumulated molecular column onto each chord's shifted grid.
 
 Both are decorated `@njit(parallel=True, fastmath=True)`.
@@ -116,7 +116,7 @@ Both are decorated `@njit(parallel=True, fastmath=True)`.
 - `estimate_chord_memory` estimates bytes per chord. The molecular path is the heavy one (it allocates native-wavelength-grid intermediates per chord, budgeted at ~640 bytes per output wavelength point); the atomic path is light (~16 bytes per wavelength point). A 2× buffer covers Python/NumPy overhead.
 - The chord grid is then processed in slices of that size.
 
-For each batch, the code: resamples the stellar surface flux (flat or PHOENIX, optionally Doppler-shifted by stellar rotation and scaled by limb darkening), masks chords blocked by the opaque planet/moon disk, computes optical depth for the unblocked chords, applies `F_in = F_out · exp(−τ)`, and accumulates `F_in`/`F_out` into per-orbital-phase sums via `np.add.at`. The returned `R = F_in_sum / F_out_sum` has shape `(orbphase_steps, n_wavelength)`.
+For each batch, the code: resamples the stellar surface flux (flat or PHOENIX, optionally Doppler-shifted by stellar rotation and scaled by limb darkening), masks chords blocked by the opaque planet/moon disk, computes optical depth for the unblocked chords, applies `F_in = F_out · exp(-τ)`, and accumulates `F_in`/`F_out` into per-orbital-phase sums via `np.add.at`. The returned `R = F_in_sum / F_out_sum` has shape `(orbphase_steps, n_wavelength)`.
 
 This keeps peak memory bounded regardless of how finely the spatial and wavelength grids are sampled, which is what makes high-resolution, large-grid runs feasible.
 
@@ -132,7 +132,7 @@ n(r) = Mdot / (4π r² v(r) μ),
 
 with two selectable velocity laws (`wind_model`):
 
-- **`'beta'`** — a modified β-law, `v(r) = v_base + (v_terminal − v_base)·max(1 − r_inner/r, 0)^β`. The finite launch speed `v_base` (default `1e-3 · v_terminal`) represents a subsonic wind base and removes the unphysical density divergence a pure β-law produces as `v → 0` at `r_inner`. Setting `β ≈ 1` with `v_terminal` near the sound speed gives a first-order approximation to a thermally driven wind.
+- **`'beta'`** — a modified β-law, `v(r) = v_base + (v_terminal - v_base)·max(1 - r_inner/r, 0)^β`. The finite launch speed `v_base` (default `1e-3 · v_terminal`) represents a subsonic wind base and removes the unphysical density divergence a pure β-law produces as `v → 0` at `r_inner`. Setting `β ≈ 1` with `v_terminal` near the sound speed gives a first-order approximation to a thermally driven wind.
 - **`'parker'`** — the **exact isothermal Parker wind** transonic solution, obtained in closed form via the Lambert-W function (`scipy.special.lambertw`). It has no free `β`/`v_terminal` knobs: the profile is fixed by the wind temperature `T` and the planet mass through the sound speed `c_s = sqrt(k_B T / wind_mu)` and the sonic radius `r_c = G M wind_mu / (2 k_B T)`. `Mdot` sets only the density normalization.
 
 A key feature is the **tracer/bulk separation** for the Parker model. A heavy trace species (e.g. Na) does not drive its own transonic wind, so its dynamics are set by the *bulk* light gas: pass `wind_mu` (the mean particle mass of the H/He outflow) to fix the velocity profile, while `mu` (the tracer mass) sets only the continuity normalization. When `wind_mu` is omitted, the dynamics use `mu` (a self-driven wind).

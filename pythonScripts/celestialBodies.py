@@ -155,7 +155,6 @@ class Star:
         and returns the wavelength and flux arrays in cgs units.
 
         Returns
-        -------
         tuple[np.ndarray, np.ndarray]
             A tuple containing:
             - Wavelength array (in cm)

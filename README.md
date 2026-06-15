@@ -124,7 +124,7 @@ Setup files are stored in `../setupFiles/` (gitignored) and outputs in `../outpu
 The `radialWind` scenario implements a beta-law velocity profile:
 
 ```
-v(r) = v_terminal × max(1 − r_inner / r, 0)^beta
+v(r) = v_terminal × max(1 - r_inner / r, 0)^beta
 n(r) = Mdot / (4π r² v(r) μ)
 ```
 
@@ -144,7 +144,7 @@ Each scenario can include any combination of absorbing and scattering constituen
 | Molecular absorber | molecule name (e.g. `H2O`, `SO2`) | Pre-computed cross-sections from ExoMOL HDF5 tables |
 | Rayleigh / power-law haze | `RayleighHaze` | σ(λ) = σ_ref · (λ_ref/λ)^slope; slope = 4 for pure Rayleigh |
 | Gray cloud deck | `GrayCloud` | Wavelength-independent σ_gray; optional cloud-top pressure cutoff |
-| Power-law aerosol | `PowerLawAerosol` | σ(λ) = σ_ref · (λ/λ_ref)^(−alpha); alpha in Ångström convention |
+| Power-law aerosol | `PowerLawAerosol` | σ(λ) = σ_ref · (λ/λ_ref)^(-alpha); alpha in Ångström convention |
 | Tabulated aerosol | `TabulatedAerosol` | σ(λ) from user-supplied CSV (wavelength [Å], sigma [cm²]) |
 
 All scattering/aerosol constituents contribute extinction to the Beer-Lambert optical depth by treating scattered photons as lost from the beam. **No scattering phase function or multiple scattering is modelled.** Cross-sections are smooth and analytic (or tabulated), so no Doppler shifting is applied to continuum opacities.

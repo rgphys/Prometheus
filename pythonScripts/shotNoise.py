@@ -30,7 +30,7 @@ classes: it operates on plain NumPy arrays of wavelength and flux so
 that it can be slotted into any post-processing pipeline.
 
 Usage overview
---------------
+--
 >>> from Prometheus.pythonScripts.shotNoise import SNRModel, apply_shot_noise
 >>>
 >>> snr_model = SNRModel.constant(snr_per_bin=847.0)
@@ -65,7 +65,7 @@ def scale_snr(baseline_snr: float,
     per-bin exposure time is ``transit_duration_hrs / num_bins``.
 
     Parameters
-    ----------
+    -
     baseline_snr : float
         SNR measured (or reported) by the ETC at baseline conditions.
     baseline_mag : float
@@ -80,7 +80,7 @@ def scale_snr(baseline_snr: float,
         Number of orbital-phase bins the transit is divided into.
 
     Returns
-    -------
+    -
     float
         Scaled SNR per wavelength bin per orbital-phase bin.
     """
@@ -99,7 +99,7 @@ class TransitParams:
     *constant* SNR mode.
 
     Attributes
-    ----------
+    -
     target_mag : float
         Apparent magnitude of the science target in the relevant band.
     transit_duration_hrs : float
@@ -120,7 +120,7 @@ class SNRModel:
     :meth:`constant`, :meth:`from_table`, or :meth:`from_uves_json`.
 
     Attributes
-    ----------
+    -
     mode : str
         One of ``"constant"``, ``"table"``, or ``"json"``.
     _snr_value : float or None
@@ -147,12 +147,12 @@ class SNRModel:
         """Create a model with a single, wavelength-independent SNR.
 
         Parameters
-        ----------
+        -
         snr_per_bin : float
             Signal-to-noise ratio per wavelength bin.
 
         Returns
-        -------
+        -
         SNRModel
         """
         return cls(mode="constant", _snr_value=snr_per_bin)
@@ -170,7 +170,7 @@ class SNRModel:
         then rescaled via :func:`scale_snr`.
 
         Parameters
-        ----------
+        -
         wav_nm : array-like
             Reference wavelengths in **nanometres**.
         snr : array-like
@@ -183,7 +183,7 @@ class SNRModel:
             Actual observing conditions for rescaling.
 
         Returns
-        -------
+        -
         SNRModel
         """
         idx = np.argsort(wav_nm)
@@ -211,7 +211,7 @@ class SNRModel:
             input.timesnr.DET1.WIN1.UIT1           (seconds)
 
         Parameters
-        ----------
+        -
         json_path : str
             Path to the JSON file.
         transit_params : TransitParams
@@ -221,7 +221,7 @@ class SNRModel:
             telescope area ratio).  Defaults to 1.0 (no correction).
 
         Returns
-        -------
+        -
         SNRModel
         """
         with open(json_path, "r") as f:
@@ -257,12 +257,12 @@ class SNRModel:
         scaling applied — the SNR values are used directly.
 
         Parameters
-        ----------
+        -
         csv_path : str
             Path to the CSV file.  Expected columns: wavelength (nm), SNR.
 
         Returns
-        -------
+        -
         SNRModel
         """
         wav, snr = [], []
@@ -291,12 +291,12 @@ class SNRModel:
         """Return the SNR per bin at a single wavelength.
 
         Parameters
-        ----------
+        -
         wavelength_nm : float
             Wavelength in nanometres.
 
         Returns
-        -------
+        -
         float
             SNR per bin.
         """
@@ -320,12 +320,12 @@ class SNRModel:
         """Return an SNR array matching an entire wavelength grid.
 
         Parameters
-        ----------
+        -
         wavelength_nm : ndarray
             Wavelength grid in nanometres.
 
         Returns
-        -------
+        -
         ndarray
             SNR per bin at each wavelength point.
         """
@@ -342,17 +342,81 @@ class SNRModel:
         return baseline_snr * math.sqrt(flux_ratio) * math.sqrt(time_ratio)
 
 
+# Resolution-element binning
+def bin_to_resolution(wavelength: np.ndarray,
+                      spectrum: np.ndarray,
+                      resolving_power: float) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a model onto a constant resolving-power instrument grid.
+
+    Prometheus builds a deliberately *non-uniform* wavelength grid (see
+    :class:`~pythonScripts.gasProperties.WavelengthGrid`): a fine step
+    (``resolutionHigh``) only within ``widthHighRes`` of each line and a coarse
+    step (``resolutionLow``) in the continuum.  A real spectrograph instead
+    samples at a roughly *constant* resolving power ``R = lambda / d_lambda`` —
+    uniform spacing in ``ln(lambda)``, i.e. the same number of resolution
+    elements per velocity interval everywhere.
+
+    Injecting per-point photon noise (:func:`apply_shot_noise`) directly on the
+    native grid therefore invents extra independent measurements inside every
+    line core, where the native grid is densest — the line cores end up
+    *oversampled*.  Binning to a constant-``R`` grid *before* adding noise
+    removes that artefact: each resolution element gets exactly one independent
+    noisy sample, matching a real instrument.
+
+    Each instrument bin takes the mean of the native samples that fall inside it
+    (a top-hat resolution-element average that smooths the oversampled cores).
+    Bins that contain no native sample — continuum regions where the model's
+    ``resolutionLow`` is coarser than one resolution element — are filled by a
+    linear interpolation of the model, so the instrument grid is uniformly
+    populated rather than artificially sparse in the continuum.
+
+    Parameters
+    -
+    wavelength : ndarray
+        Native model wavelengths.  Any consistent unit (nm, cm, Angstrom): only
+        ratios are used, and the returned centres are in the same unit.  Need
+        not be uniformly spaced.
+    spectrum : ndarray
+        Model values on ``wavelength`` (e.g. transmission, or transit depth).
+    resolving_power : float
+        Instrument resolving power ``R = lambda / d_lambda``.
+
+    Returns
+    -
+    wav_binned : ndarray
+        Geometric bin centres of the constant-``R`` instrument grid.
+    spectrum_binned : ndarray
+        Resolution-element-averaged model on that grid.
+    """
+    wav = np.asarray(wavelength, dtype=float)
+    spec = np.asarray(spectrum, dtype=float)
+    lo, hi = wav.min(), wav.max()
+    # One bin per resolution element: d(ln lambda) = 1 / R across [lo, hi].
+    n = max(int(np.ceil(resolving_power * math.log(hi / lo))), 1)
+    edges = lo * np.exp(np.linspace(0.0, math.log(hi / lo), n + 1))
+    centres = np.sqrt(edges[:-1] * edges[1:])            # geometric bin centres
+    idx = np.clip(np.digitize(wav, edges) - 1, 0, n - 1)
+    sums = np.bincount(idx, weights=spec, minlength=n)
+    counts = np.bincount(idx, minlength=n)
+    binned = np.full(n, np.nan)
+    filled = counts > 0
+    binned[filled] = sums[filled] / counts[filled]
+    if (~filled).any():                                  # empty (coarse) bins
+        binned[~filled] = np.interp(centres[~filled], wav, spec)
+    return centres, binned
+
+
 # Noise Application
 def sigma_from_snr(snr: float | np.ndarray) -> np.ndarray:
     """Convert SNR to 1-sigma fractional noise level.
 
     Parameters
-    ----------
+    -
     snr : float or ndarray
         Signal-to-noise ratio (must be > 0).
 
     Returns
-    -------
+    -
     ndarray
         1-sigma noise amplitude (dimensionless, same units as the flux).
     """
@@ -365,8 +429,15 @@ def apply_shot_noise(wavelength_nm: np.ndarray,
                      seed: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
     """Add Gaussian shot noise to a transmission spectrum.
 
+    Noise is injected independently at every supplied wavelength point, so the
+    spectrum should already be on a realistic *instrument* grid.  Pass a native
+    Prometheus grid here and the line cores — which Prometheus oversamples — get
+    extra independent noise draws.  Call :func:`bin_to_resolution` first to put
+    the model on a constant resolving-power grid (one independent sample per
+    resolution element).
+
     Parameters
-    ----------
+    -
     wavelength_nm : ndarray
         Wavelength grid in nanometres.
     spectrum : ndarray
@@ -377,7 +448,7 @@ def apply_shot_noise(wavelength_nm: np.ndarray,
         Random seed for reproducibility.
 
     Returns
-    -------
+    -
     noisy_spectrum : ndarray
         Spectrum with Gaussian noise added.
     sigma : ndarray

@@ -16,7 +16,7 @@ For a given orbital phase and wavelength grid, Prometheus integrates the Beer–
 R(λ, orbphase) = Σ_chords F_in(λ) / Σ_chords F_out(λ)
 ```
 
-where `F_out = ρ · F_star` is the unobscured stellar flux for a chord and `F_in = F_out · exp(−τ)` is the transmitted flux. The result `R` is the in-transit/out-of-transit flux ratio; `1 − R` is the excess absorption (transit depth) at each wavelength. Running over an array of orbital phases produces a transit light curve or a phase-resolved transmission map.
+where `F_out = ρ · F_star` is the unobscured stellar flux for a chord and `F_in = F_out · exp(-τ)` is the transmitted flux. The result `R` is the in-transit/out-of-transit flux ratio; `1 - R` is the excess absorption (transit depth) at each wavelength. Running over an array of orbital phases produces a transit light curve or a phase-resolved transmission map.
 
 The opacity along each chord can combine:
 

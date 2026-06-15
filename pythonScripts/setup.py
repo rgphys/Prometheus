@@ -453,9 +453,11 @@ def setupRayleighHaze(key_scenario):
     params['chi'] = NumericalQuestion('Enter the abundance (particle-to-gas number ratio) of the Rayleigh haze in the ' +
                                       key_scenario + ' scenario:', 0., 1e30, 1., acceptLowerBorder=False).readValue()
     params['sigma_ref'] = NumericalQuestion(
-        'Enter the reference Rayleigh extinction cross-section (sigma_ref) in cm^2:', 0., 1., 1., acceptLowerBorder=False).readValue()
+        'Enter the reference Rayleigh extinction cross-section (sigma_ref) in cm^2 '
+        '(Lecavelier des Etangs et al. 2008 H2 baseline: 5.31e-27 at lambda_ref=3500 A):', 0., 1., 1., acceptLowerBorder=False).readValue()
     params['lambda_ref'] = NumericalQuestion(
-        'Enter the reference wavelength (lambda_ref) for the Rayleigh cross-section in Angstrom:', 500, 55000, 1e-8, roundBorders=False).readValue()
+        'Enter the reference wavelength (lambda_ref) for the Rayleigh cross-section in Angstrom '
+        '(use 3500 to pair with the 5.31e-27 H2 baseline):', 500, 55000, 1e-8, roundBorders=False).readValue()
     params['slope'] = NumericalQuestion(
         'Enter the Rayleigh slope exponent (4 corresponds to pure Rayleigh scattering):', 0., 20., 1.).readValue()
     return 'RayleighHaze', params
