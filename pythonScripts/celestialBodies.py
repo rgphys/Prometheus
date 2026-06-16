@@ -102,6 +102,56 @@ class Star:
         """
         self.CLV_function = CLV_function
 
+    def addStellarContamination(self, spot_fraction: float = 0.0,
+                                spot_temp: Optional[float] = None,
+                                fac_fraction: float = 0.0,
+                                fac_temp: Optional[float] = None) -> None:
+        """Adds unocculted-spot/facula contamination (transit light source effect).
+
+        Models the wavelength-dependent transit-depth bias from active regions
+        outside the transit chord (Sing+2011; Rackham+2018).  This is a
+        disk-integrated stellar effect applied to the final transit depth, NOT a
+        center-to-limb (chord) effect, so it is distinct from the CLV machinery.
+
+        Args:
+            spot_fraction (float): Unocculted dark-spot covering fraction [0,1).
+            spot_temp (Optional[float]): Spot temperature [K]. Defaults to
+                0.86*T_eff (a typical cool-spot contrast) if spots are present.
+            fac_fraction (float): Unocculted bright-facula covering fraction.
+            fac_temp (Optional[float]): Facula temperature [K]. Defaults to
+                T_eff + 100 K if faculae are present.
+        """
+        self.spot_fraction: float = spot_fraction
+        self.spot_temp: float = spot_temp if spot_temp is not None else 0.86 * self.T_eff
+        self.fac_fraction: float = fac_fraction
+        self.fac_temp: float = fac_temp if fac_temp is not None else self.T_eff + 100.0
+
+    def stellarContaminationFactor(self, wavelength: np.ndarray) -> np.ndarray:
+        """Transit-depth contamination factor epsilon(lambda) (TLSE).
+
+        ``D_observed = D_clean * epsilon``, with
+        ``epsilon = 1/(1 - sum_k f_k (1 - B(lambda,T_k)/B(lambda,T_phot)))``
+        over active regions k (Planck blackbody surface brightnesses).
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Multiplicative depth factor, same shape as wavelength.
+        """
+        h_planck = 6.626e-27
+        hc_k = h_planck * const.c / const.k_B
+
+        def planck(T):
+            return 1.0 / (wavelength ** 5 * np.expm1(hc_k / (wavelength * T)))
+        Bp = planck(self.T_eff)
+        dimming = np.zeros_like(wavelength)
+        if getattr(self, 'spot_fraction', 0.0) > 0:
+            dimming = dimming + self.spot_fraction * (1.0 - planck(self.spot_temp) / Bp)
+        if getattr(self, 'fac_fraction', 0.0) > 0:
+            dimming = dimming + self.fac_fraction * (1.0 - planck(self.fac_temp) / Bp)
+        return 1.0 / (1.0 - dimming)
+
     def addRMparameters(self, vsiniStarrot: float, phiStarrot: float) -> None:
         """Adds Rossiter-McLaughlin effect parameters to the star.
 

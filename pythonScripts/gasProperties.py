@@ -165,6 +165,58 @@ def _bilinear_PT_interp(P_vals, T_val, P_grid, T_grid, sigma_grid_log, lookupOff
 
     return out
 
+
+@njit(parallel=True, fastmath=True)
+def _bilinear_PT_interp_Tvec(P_vals, T_vals, P_grid, T_grid, sigma_grid_log, lookupOffset):
+    """Same as _bilinear_PT_interp but with a PER-POINT temperature T_vals
+    (n_points,), for non-isothermal atmospheres where each line-of-sight cell
+    has its own local T.  Bilinear in (P, T) per point."""
+    n_points = len(P_vals)
+    n_P = len(P_grid)
+    n_T = len(T_grid)
+    n_wav = sigma_grid_log.shape[2]
+    out = np.empty((n_points, n_wav), dtype=np.float64)
+
+    for p in prange(n_points):
+        T_val = T_vals[p]
+        ti = np.searchsorted(T_grid, T_val) - 1
+        if ti < 0:
+            ti = 0
+        if ti >= n_T - 1:
+            ti = n_T - 2
+        t_T = (T_val - T_grid[ti]) / (T_grid[ti + 1] - T_grid[ti])
+        w_T0 = 1.0 - t_T
+        w_T1 = t_T
+
+        P_val = P_vals[p]
+        if P_val <= P_grid[0]:
+            pi = 0
+            t_P = 0.0
+        elif P_val >= P_grid[n_P - 1]:
+            pi = n_P - 2
+            t_P = 1.0
+        else:
+            pi = np.searchsorted(P_grid, P_val) - 1
+            if pi < 0:
+                pi = 0
+            if pi >= n_P - 1:
+                pi = n_P - 2
+            t_P = (P_val - P_grid[pi]) / (P_grid[pi + 1] - P_grid[pi])
+
+        w00 = (1.0 - t_P) * w_T0
+        w10 = t_P * w_T0
+        w01 = (1.0 - t_P) * w_T1
+        w11 = t_P * w_T1
+
+        for w in range(n_wav):
+            log_val = (w00 * sigma_grid_log[pi, ti, w]
+                     + w10 * sigma_grid_log[pi + 1, ti, w]
+                     + w01 * sigma_grid_log[pi, ti + 1, w]
+                     + w11 * sigma_grid_log[pi + 1, ti + 1, w])
+            out[p, w] = 10.0 ** log_val - lookupOffset
+
+    return out
+
 class CollisionalAtmosphere:
     """Base class for a collisional atmosphere with a defined temperature and pressure.
 
@@ -326,6 +378,77 @@ class HydrostaticAtmosphere(CollisionalAtmosphere):
             (const.k_B * self.T * r) * np.heaviside(r - self.planet.R, 1.)
         n = n_0 * np.exp(Jeans - Jeans_0)
         return n
+
+
+class NonIsothermalHydrostaticAtmosphere(CollisionalAtmosphere):
+    """Hydrostatic atmosphere with a power-law temperature-pressure profile.
+
+        T(P) = T_ref * (P / P_0) ** beta,   beta >= 0  (cooler aloft, hotter deep)
+
+    beta = 0 recovers the isothermal HydrostaticAtmosphere.  The radial pressure
+    structure is obtained by integrating hydrostatic equilibrium with altitude-
+    dependent g(r) = G M / r^2:
+
+        d ln P / dr = - mu G M / (k_B T(P) r^2),
+
+    inward-consistent with P(R_p) = P_0.  Density n(r) = P(r) / (k_B T(r)) and
+    the local temperature T(r) are tabulated on a fine radial grid at init and
+    interpolated.  Molecular cross-sections are then evaluated at the LOCAL
+    T(r) along each line of sight (see getLOSopticalDepth_Batch).
+
+    Attributes:
+        isNonIsothermal (bool): marks the per-cell-temperature opacity path.
+    """
+
+    def __init__(self, T_ref: float, P_0: float, mu: float, planet: Any,
+                 beta: float = 0.0, T_min_frac: float = 0.4,
+                 n_H_ceiling: float = 40.0, n_grid: int = 4000):
+        super().__init__(T_ref, P_0)
+        self.T_ref: float = T_ref
+        self.beta: float = beta
+        self.T_min: float = T_min_frac * T_ref     # isothermal upper-atmosphere floor
+        self.mu: float = mu
+        self.planet: Any = planet
+        self.isNonIsothermal: bool = True
+
+        Rp = planet.R
+        H_ref = const.k_B * T_ref * Rp ** 2 / (const.G * mu * planet.M)  # ~scale height
+        r_top = Rp + n_H_ceiling * H_ref
+        r_grid = np.linspace(Rp, r_top, n_grid)
+        # integrate d ln(P) / dr = -(mu G M) / (k T(P) r^2), with T floored so the
+        # upper atmosphere is isothermal (avoids T -> 0 as P -> 0).
+        c0 = const.G * mu * planet.M / const.k_B
+        lnu = np.zeros(n_grid)
+        for i in range(1, n_grid):
+            dr = r_grid[i] - r_grid[i - 1]
+            r_mid = 0.5 * (r_grid[i] + r_grid[i - 1])
+            u_prev = np.exp(lnu[i - 1])
+            T_local = max(T_ref * u_prev ** beta, self.T_min)
+            lnu[i] = lnu[i - 1] - c0 / (T_local * r_mid ** 2) * dr
+        u = np.exp(lnu)                                   # P/P_0 along r_grid
+        P = P_0 * u
+        T = np.maximum(T_ref * u ** beta, self.T_min)
+        n = P / (const.k_B * T)
+        self._r_grid = r_grid
+        self._logn_grid = np.log(n)
+        self._T_grid_prof = T
+        self._n0 = n[0]
+
+    def getReferenceNumberDensity(self) -> float:
+        return self.P_0 / (const.k_B * self.T_ref)
+
+    def calculateNumberDensity(self, x, phi, rho, orbphase):
+        r = self.planet.getDistanceFromPlanet(x, phi, rho, orbphase)
+        logn = np.interp(r, self._r_grid, self._logn_grid,
+                         left=self._logn_grid[0], right=-np.inf)
+        n = np.exp(logn)
+        return np.where(r >= self.planet.R, n, 0.0)
+
+    def calculateTemperature(self, x, phi, rho, orbphase):
+        r = self.planet.getDistanceFromPlanet(x, phi, rho, orbphase)
+        T = np.interp(r, self._r_grid, self._T_grid_prof,
+                      left=self._T_grid_prof[0], right=self._T_grid_prof[-1])
+        return T
 
 
 class PowerLawAtmosphere(CollisionalAtmosphere):
@@ -1255,7 +1378,7 @@ class MolecularConstituent:
 # Reserved species keys identifying continuum scattering/aerosol constituents.
 # These are matched in prometheus.py and setup.py to distinguish scattering
 # sources from atomic/ionic species and molecular HDF5 lookup tables.
-SCATTERER_TYPES: Tuple[str, ...] = ('RayleighHaze', 'GrayCloud', 'PowerLawAerosol', 'TabulatedAerosol')
+SCATTERER_TYPES: Tuple[str, ...] = ('RayleighHaze', 'GrayCloud', 'PowerLawAerosol', 'TabulatedAerosol', 'MieAerosol')
 
 
 class ScatteringConstituent:
@@ -1285,7 +1408,8 @@ class ScatteringConstituent:
             scenario (e.g. barometric/hydrostatic); ignored otherwise.
     """
 
-    def __init__(self, chi: float, P_top: Union[float, None] = None):
+    def __init__(self, chi: float, P_top: Union[float, None] = None,
+                 scale_height_factor: float = 1.0):
         """Initializes the ScatteringConstituent.
 
         Args:
@@ -1293,11 +1417,24 @@ class ScatteringConstituent:
             P_top (Optional[float]): Cloud-top pressure in cgs (barye). The
                 opacity is confined to where the local pressure exceeds this
                 value. Defaults to None (no confinement).
+            scale_height_factor (float): Ratio of the aerosol scale height to
+                the host-gas scale height, ``f = H_aerosol / H_gas``.  With
+                ``f = 1`` the particles are well-mixed (the default, riding the
+                gas density ``chi * n_gas``).  For ``f != 1`` the particle
+                number density is reprofiled to its own scale height,
+                ``n_aer(r) = chi * n_ref * (n_gas(r) / n_ref)**(1/f)`` (an
+                isothermal fractional-scale-height condensate, Heng & Kitzmann
+                2017): ``f > 1`` lofts the aerosol to higher altitude (steeper,
+                super-Rayleigh-looking optical slope at a *physical* grain size
+                and temperature), ``f < 1`` settles it.  Requires a host with a
+                reference number density (barometric/hydrostatic); ignored
+                otherwise.
         """
         self.isMolecule: bool = False
         self.isScatterer: bool = True
         self.chi: float = chi
         self.P_top: Union[float, None] = P_top
+        self.scale_height_factor: float = float(scale_height_factor)
         self._sigma_cache: dict = {}
 
     def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
@@ -1517,6 +1654,165 @@ class TabulatedAerosol(ScatteringConstituent):
         return np.interp(wavelength, self._wav_cm, self._sigma_table)
 
 
+def _load_optical_constants(path: str, oc_format: str = 'auto'):
+    """Load a published complex refractive index table (n, k)(lambda).
+
+    Supports the native formats shipped in ``Resources/optical_constants/``:
+    Oxford ARIA ``.ri`` (``aria``), LX-MIE ``.dat`` (``lxmie``), Draine
+    ``callindex``/``astrosil`` (``draine``), and the VIRGA solid-CH4 CSV
+    (``ch4``).  ``'auto'`` guesses from the file contents/extension.
+
+    Args:
+        path (str): Path to the optical-constant file.
+        oc_format (str): One of ``'auto','aria','lxmie','draine','ch4'``.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]: (wl_um, n, k) sorted by
+            ascending wavelength.
+    """
+    with open(path, encoding='latin-1') as f:
+        lines = [ln.rstrip('\r\n') for ln in f]
+    if oc_format == 'auto':
+        head = '\n'.join(lines[:40]).upper()
+        if 'WAVE(UM)' in head:
+            oc_format = 'draine'
+        elif 'FORMAT=' in head:
+            oc_format = 'aria'
+        elif path.lower().endswith('.csv'):
+            oc_format = 'ch4'
+        else:
+            oc_format = 'lxmie'
+
+    rows, started, fmt = [], False, None
+    for ln in lines:
+        s = ln.strip()
+        if oc_format == 'draine':
+            if 'wave(um)' in ln:
+                started = True
+                continue
+            if not started:
+                continue
+            p = ln.split()
+            if len(p) >= 5:
+                try:
+                    rows.append([float(p[0]), float(p[3]) + 1.0, float(p[4])])
+                except ValueError:
+                    pass
+        elif oc_format == 'ch4':
+            p = ln.split(',')
+            if len(p) >= 6:
+                try:
+                    freq, n, k = float(p[0]), float(p[1]), float(p[2])
+                except ValueError:
+                    continue
+                wl = p[5].strip()
+                wl_um = float(wl) if wl else (1e4 / freq if freq > 0 else np.nan)
+                if np.isfinite(wl_um):
+                    rows.append([wl_um, n, k])
+        else:  # aria / lxmie
+            if not s:
+                continue
+            if s.startswith('#'):
+                up = s.upper().replace(' ', '')
+                if 'FORMAT=WAVN' in up:
+                    fmt = 'WAVN'
+                elif 'FORMAT=WAVL' in up:
+                    fmt = 'WAVL'
+                continue
+            p = s.replace(',', ' ').split()
+            try:
+                rows.append([float(p[0]), float(p[1]), float(p[2])])
+            except (ValueError, IndexError):
+                pass
+    a = np.array(rows, dtype=float)
+    x, n, k = a[:, 0], a[:, 1], a[:, 2]
+    wl = 1e4 / x if (oc_format == 'aria' and fmt == 'WAVN') else x
+    idx = np.argsort(wl)
+    return wl[idx], n[idx], np.clip(k[idx], 0.0, None)
+
+
+class MieAerosol(ScatteringConstituent):
+    """Aerosol extinction from Mie theory + real published optical constants.
+
+    Unlike :class:`RayleighHaze`/:class:`PowerLawAerosol` (single analytic power
+    law) or :class:`TabulatedAerosol` (a frozen cross-section table), this
+    constituent computes the per-particle extinction cross-section on the fly
+    from a complex refractive index ``m = n - ik`` (loaded from a published
+    optical-constant file) for a chosen grain size, averaged over a log-normal
+    size distribution::
+
+        sigma_ext(lambda) = < Q_ext(2 pi r / lambda, m) * pi r^2 >_{r ~ lognormal}
+
+    The grain effective radius ``r_eff`` is therefore a *physical* free
+    parameter.  A real Mie curve naturally reproduces the curved optical slope
+    that a single power law cannot: super-Rayleigh in the blue (2 pi r << lambda)
+    rolling over to gray in the red (2 pi r >~ lambda), with the transition set
+    by r_eff.  Composition (silicate, sulphate, ice, organic) is selected by the
+    optical-constant file, tying the aerosol to a concrete condensate / exomoon
+    dust source.
+
+    Scattering is treated as extinction out of the beam — no phase function or
+    multiple scattering is modelled (consistent with the other scatterers).
+
+    Attributes:
+        r_eff (float): Geometric-median grain radius [um].
+        sigma_g (float): Geometric standard deviation of the log-normal.
+        n_radii (int): Number of radius quadrature points.
+    """
+
+    def __init__(self, chi: float = 1.0, optical_constants: str = '',
+                 r_eff: float = 0.1, sigma_g: float = 1.6, n_radii: int = 40,
+                 oc_format: str = 'auto', P_top: Union[float, None] = None,
+                 scale_height_factor: float = 1.0):
+        """Initializes the MieAerosol.
+
+        Args:
+            chi (float): Particle-to-gas abundance ratio. Defaults to 1.0.
+            optical_constants (str): Path to an (n, k) optical-constant file
+                (see :func:`_load_optical_constants` for supported formats).
+            r_eff (float): Geometric-median grain radius [um]. Defaults to 0.1.
+            sigma_g (float): Geometric width of the log-normal. Defaults to 1.6.
+            n_radii (int): Radius quadrature points. Defaults to 40.
+            oc_format (str): Optical-constant file format hint. Defaults 'auto'.
+            P_top (Optional[float]): Cloud-top pressure [barye]. Defaults to None.
+            scale_height_factor (float): Aerosol-to-gas scale-height ratio
+                (lofted condensate). Defaults to 1.0 (well-mixed).
+        """
+        super().__init__(chi, P_top, scale_height_factor)
+        self.optical_constants: str = optical_constants
+        self.r_eff: float = float(r_eff)
+        self.sigma_g: float = float(sigma_g)
+        self.n_radii: int = int(n_radii)
+        self._wl_um, self._n, self._k = _load_optical_constants(
+            optical_constants, oc_format)
+
+    def calculateSigmaAbs(self, wavelength: np.ndarray) -> np.ndarray:
+        """Computes the Mie extinction cross-section [cm^2] on a wavelength grid.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm].
+
+        Returns:
+            np.ndarray: Extinction cross-section per particle [cm^2].
+        """
+        import miepython
+        lam_um = wavelength * 1e4
+        n_lam = np.interp(lam_um, self._wl_um, self._n)
+        k_lam = np.clip(np.interp(lam_um, self._wl_um, self._k), 0.0, None)
+        m = n_lam - 1j * k_lam
+        ln_sg = np.log(self.sigma_g)
+        radii = np.geomspace(self.r_eff / self.sigma_g ** 3,
+                             self.r_eff * self.sigma_g ** 3, self.n_radii)
+        w = np.exp(-0.5 * (np.log(radii / self.r_eff) / ln_sg) ** 2) / radii
+        w /= w.sum()
+        sig_um2 = np.zeros_like(lam_um)
+        for r, wr in zip(radii, w):
+            x = 2.0 * np.pi * r / lam_um            # size parameter
+            qext = miepython.efficiencies_mx(m, x)[0]
+            sig_um2 += wr * qext * np.pi * r ** 2   # um^2
+        return sig_um2 * 1e-8                       # um^2 -> cm^2
+
+
 def makeScatteringConstituent(scattererType: str, paramsDict: dict) -> ScatteringConstituent:
     """Factory for scattering constituents from a setup-file parameter dict.
 
@@ -1562,6 +1858,17 @@ def makeScatteringConstituent(scattererType: str, paramsDict: dict) -> Scatterin
             filepath=paramsDict['filepath'],
             extrapolate=paramsDict.get('extrapolate', 'edge'),
             P_top=P_top,
+        )
+    elif scattererType == 'MieAerosol':
+        return MieAerosol(
+            chi=chi,
+            optical_constants=paramsDict['optical_constants'],
+            r_eff=paramsDict.get('r_eff', 0.1),
+            sigma_g=paramsDict.get('sigma_g', 1.6),
+            n_radii=paramsDict.get('n_radii', 40),
+            oc_format=paramsDict.get('oc_format', 'auto'),
+            P_top=P_top,
+            scale_height_factor=paramsDict.get('scale_height_factor', 1.0),
         )
     raise ValueError(f"Unknown scattering constituent type: {scattererType}")
 
@@ -1685,13 +1992,22 @@ class Atmosphere:
             )  # (n_chords, n_x)
             n_x_local = n_tot.shape[1]
 
+            # --- non-isothermal local temperature field (n_chords, n_x) ---
+            nonisothermal = getattr(dist_model, 'isNonIsothermal', False)
+            if nonisothermal:
+                T_field = dist_model.calculateTemperature(
+                    x_grid, phi_batch, rho_batch, orbphase_batch)
+
             for constituent in dist_model.constituents:
                 if constituent.isMolecule:
                     #  Optimizations 2 + 4: decomposed P-T interpolation 
                     # 1) bilinear-interpolate over (P, T) per x-step on native wav grid
                     # 2) accumulate the weighted column on the native grid
                     # 3) 1-D interpolate the result onto the Doppler-shifted grid
-                    P = n_tot * const.k_B * dist_model.T                        # (n_chords, n_x)
+                    if nonisothermal:
+                        P = n_tot * const.k_B * T_field                          # (n_chords, n_x)
+                    else:
+                        P = n_tot * const.k_B * dist_model.T                     # (n_chords, n_x)
                     P_clamped = np.clip(P, 1e-4, None)
                     n_abs = n_tot * constituent.chi                              # (n_chords, n_x)
 
@@ -1699,11 +2015,17 @@ class Atmosphere:
                     sigma_eff = np.zeros((n_chords, n_wav_native))
 
                     for xi in range(n_x_local):
-                        sigma_xi = _bilinear_PT_interp(
-                            P_clamped[:, xi], dist_model.T,
-                            constituent.P_grid, constituent.T_grid,
-                            constituent.sigma_grid_log, constituent.lookupOffset
-                        )                                                        # (n_chords, n_wav_native)
+                        if nonisothermal:
+                            sigma_xi = _bilinear_PT_interp_Tvec(
+                                P_clamped[:, xi], T_field[:, xi],
+                                constituent.P_grid, constituent.T_grid,
+                                constituent.sigma_grid_log, constituent.lookupOffset)
+                        else:
+                            sigma_xi = _bilinear_PT_interp(
+                                P_clamped[:, xi], dist_model.T,
+                                constituent.P_grid, constituent.T_grid,
+                                constituent.sigma_grid_log, constituent.lookupOffset
+                            )                                                    # (n_chords, n_wav_native)
                         sigma_eff += n_abs[:, xi, np.newaxis] * sigma_xi
 
                     sigma_eff *= delta_x
@@ -1713,6 +2035,15 @@ class Atmosphere:
                 elif getattr(constituent, 'isScatterer', False):
                     # Continuum scattering: cross-section wavelength-only, no Doppler
                     n_abs = n_tot * constituent.chi                              # (n_chords, n_x)
+                    # Independent aerosol scale height f = H_aer / H_gas:
+                    # n_aer = chi * n_ref * (n_gas/n_ref)**(1/f).  f=1 -> n_abs.
+                    fH = getattr(constituent, 'scale_height_factor', 1.0)
+                    if fH != 1.0 and hasattr(dist_model, 'getReferenceNumberDensity'):
+                        n_ref = dist_model.getReferenceNumberDensity()
+                        ratio = np.where(n_tot > 0.0, n_tot / n_ref, 0.0)
+                        n_abs = np.where(n_tot > 0.0,
+                                         constituent.chi * n_ref * ratio ** (1.0 / fH),
+                                         0.0)
                     if constituent.P_top is not None and hasattr(dist_model, 'T'):
                         P = n_tot * const.k_B * dist_model.T
                         n_abs = np.where(P >= constituent.P_top, n_abs, 0.0)
