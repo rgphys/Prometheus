@@ -1632,8 +1632,9 @@ class TabulatedAerosol(ScatteringConstituent):
 
     def __init__(self, chi: float = 1.0, filepath: str = '',
                  extrapolate: str = 'edge',
-                 P_top: Union[float, None] = None):
-        super().__init__(chi, P_top)
+                 P_top: Union[float, None] = None,
+                 scale_height_factor: float = 1.0):
+        super().__init__(chi, P_top, scale_height_factor)
         self.filepath: str = filepath
         if extrapolate not in ('edge', 'zero'):
             raise ValueError(
@@ -1858,6 +1859,7 @@ def makeScatteringConstituent(scattererType: str, paramsDict: dict) -> Scatterin
             filepath=paramsDict['filepath'],
             extrapolate=paramsDict.get('extrapolate', 'edge'),
             P_top=P_top,
+            scale_height_factor=paramsDict.get('scale_height_factor', 1.0),
         )
     elif scattererType == 'MieAerosol':
         return MieAerosol(
