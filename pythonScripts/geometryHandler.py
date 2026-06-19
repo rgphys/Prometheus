@@ -206,3 +206,50 @@ class Grid:
             (phiGrid.flatten(), rhoGrid.flatten(), orbphaseGrid.flatten()), axis=-1
         )
         return chordGrid
+
+
+def spatial_grid(planet, x_border_Rp: float = 12.0, x_steps: int = 25,
+                 rho_steps: int = 60, phi_steps: int = 30,
+                 orbphase_window: float = 0.0, orbphase_steps: int = 1,
+                 rho_border=None) -> 'Grid':
+    """Builds a :class:`Grid` with defaults tuned for an extended exosphere.
+
+    The line-of-sight chord is centred on the planet's orbital distance and the
+    sky-plane integration radius defaults to the stellar radius (so the transit
+    depth normalises by the full stellar disk).
+
+    Args:
+        planet: A planet object exposing ``R``, ``a`` and ``hostStar.R``.
+        x_border_Rp (float): Half-length of the LOS chord, in planet radii.
+        x_steps (int): Number of steps along the line-of-sight axis.
+        rho_steps (int): Number of steps along the sky-plane radial axis.
+        phi_steps (int): Number of steps along the azimuthal axis.
+        orbphase_window (float): Half-window of orbital phase [rad] (0 -> a
+            single phase at mid-transit; >0 -> a lightcurve).
+        orbphase_steps (int): Number of orbital-phase samples.
+        rho_border (Optional[float]): Sky-plane integration radius [cm]
+            (default: the stellar radius; do not shrink it, as the depth
+            normalisation is by the stellar disk).
+
+    Returns:
+        Grid: The constructed spatial/temporal grid.
+    """
+    rho_border = planet.hostStar.R if rho_border is None else rho_border
+    return Grid(
+        x_midpoint=planet.a, x_border=x_border_Rp * planet.R, x_steps=x_steps,
+        rho_border=rho_border, rho_steps=rho_steps, phi_steps=phi_steps,
+        orbphase_border=orbphase_window, orbphase_steps=orbphase_steps)
+
+
+def orbphase_window_from_hours(planet, half_window_hours: float) -> float:
+    """Converts a +/- time half-window [hours] to an orbital-phase half-window [rad].
+
+    Args:
+        planet: A planet object exposing ``orbitalPeriod`` [days].
+        half_window_hours (float): Half-window around mid-transit [hours].
+
+    Returns:
+        float: The corresponding orbital-phase half-window [rad].
+    """
+    period_hours = planet.orbitalPeriod * 24.0
+    return (half_window_hours / period_hours) * 2.0 * np.pi

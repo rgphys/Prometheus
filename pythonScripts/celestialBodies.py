@@ -210,7 +210,7 @@ class Star:
             - Wavelength array (in cm)
             - Flux array (in cgs units, divided by pi)
         """
-        # These contain the acceptable values.
+        # Acceptable PHOENIX grid values for each stellar parameter.
         T_grid = np.concatenate(
             (np.arange(2300, 7100, 100), np.arange(7200, 12200, 200)))
         log_g_grid = np.arange(0, 6.5, 0.5)
@@ -226,7 +226,7 @@ class Star:
         # This is where phoenix spectra are located.
         root = 'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/'
 
-        # We assemble a combination of strings to parse the user input into the URL,
+        # Build the PHOENIX URL path from rounded grid parameters.
         z_string = '{:.1f}'.format(float(Z_a))
         if Z_a > 0:
             z_string = '+' + z_string
@@ -244,13 +244,12 @@ class Star:
             t_string = '0'+t_string
         g_string = '-'+'{:.2f}'.format(float(log_g_a))
 
-        # These are URLS for the input files.
+        # PHOENIX FTP URLs for the wavelength grid and the spectrum.
         waveurl = root+'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits'
         specurl = root+'PHOENIX-ACES-AGSS-COND-2011/Z'+z_string+a_string+'/lte' + \
             t_string+g_string+z_string+a_string+'.PHOENIX-ACES-AGSS-COND-2011-HiRes.fits'
 
-        # These are the output filenames, they will also be returned so that the wrapper
-        # of this function can take them in.
+        # Local cache paths for the downloaded FITS files.
         cache_dir = os.path.join(os.path.dirname(__file__), "phoenix_cache")
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
@@ -258,7 +257,7 @@ class Star:
         wavename = os.path.join(cache_dir, 'WAVE.fits')
         specname = os.path.join(cache_dir, f'lte{t_string}{g_string}{z_string}{a_string}.fits')
 
-        # Only download if the files don't exist
+        # Download once; skip if already cached.
         if not os.path.exists(wavename):
             print(f"Downloading WAVE.fits (this will only happen once)...")
             with closing(request.urlopen(waveurl)) as r:
@@ -275,7 +274,8 @@ class Star:
         w = fits.getdata(wavename)
 
         return (w * 1e-8, F / np.pi)
-        # a seemingly random factor of pi, but this should not bother the transit calculations here.
+        # PHOENIX outputs pi*H_lambda (Eddington flux); dividing by pi gives surface intensity.
+        # Only the shape matters here: the factor cancels in the F_in/F_out transit ratio.
 
     def calculateCLV(self, rho: float) -> float:
         """Calculates the center-to-limb variation (CLV) factor for a given radius.
@@ -730,3 +730,131 @@ class AvailablePlanets:
                 return planet
         print('System', namePlanet, 'was not found.')
         return None
+
+
+"""
+Convenience constructors and moon orbital-mechanics helpers.
+
+These wrap the body constructors above with research-sensible defaults so a
+system can be set up in a couple of lines, and collect the moon:planet
+orbital-mechanics relations used to place a moon for transit (e.g. the optimal
+mid-transit phase that maximises the moon's sky-plane displacement).  All
+lengths are CGS.
+"""
+
+
+def find_planet(name: str) -> Planet:
+    """Looks up a pre-defined :class:`Planet` by name.
+
+    Args:
+        name (str): Planet name as it appears in ``Resources/planets.csv``.
+
+    Returns:
+        Planet: The matching planet object.
+
+    Raises:
+        ValueError: If no planet with that name is available.
+    """
+    planet = AvailablePlanets().findPlanet(name)
+    if planet is None:
+        raise ValueError(f"Planet {name!r} not found in Prometheus resources.")
+    return planet
+
+
+def make_moon(planet: Planet, a_over_Rp: float = 1.7, R: Optional[float] = None,
+              midTransitOrbphase: float = 0.375 * 2.0 * np.pi) -> 'Moon':
+    """Builds a :class:`Moon` orbiting ``planet``.
+
+    Args:
+        planet (Planet): The host planet.
+        a_over_Rp (float): Moon semi-major axis in planet radii (default 1.7).
+        R (Optional[float]): Moon radius [cm] (default Io's radius).
+        midTransitOrbphase (float): Moon orbital phase at the planet's
+            mid-transit [rad].
+
+    Returns:
+        Moon: The constructed moon object.
+    """
+    R = const.R_Io if R is None else R
+    return Moon(midTransitOrbphase=midTransitOrbphase, R=R,
+                a=a_over_Rp * planet.R, hostPlanet=planet)
+
+
+#  Optimal moon phase theory (see Tests/midtransit_phase_proof.tex)
+#
+# The moon's sky-plane offset during transit is
+#     y_m(theta) = a_p sin(theta) + a_m sin(theta_0 + N theta),
+# with N the moon:planet mean-motion ratio.  Writing eps = a_m/a_p and
+# expanding the lightcurve L = f(y_m/a_p) to first order in eps, the only
+# time-antisymmetric (i.e. detectable against any symmetric bare-planet
+# model) term is  eps sin(theta_0) f'(theta) cos(N theta), so every
+# asymmetry observable is proportional to sin(theta_0) and maximised at
+# quadrature.  The peak displacement admits an exact all-orders optimum at
+# quadrature corrected by the moon's own motion during the displacement.
+
+
+def mean_motion_ratio(planet: Planet, a_over_Rp: float = 1.7) -> float:
+    """Moon:planet mean-motion ratio ``N = sqrt(a_p^3 M_p / (a_m^3 M_star))``.
+
+    Args:
+        planet (Planet): The host planet.
+        a_over_Rp (float): Moon semi-major axis in planet radii.
+
+    Returns:
+        float: The dimensionless mean-motion ratio.
+    """
+    a_m = a_over_Rp * planet.R
+    return float(np.sqrt((planet.a**3 * planet.M) /
+                         (a_m**3 * planet.hostStar.M)))
+
+
+def optimal_midtransit_phase(planet: Planet, a_over_Rp: float = 1.7,
+                             branch: str = 'late') -> float:
+    """Moon phase at mid-transit maximising the lightcurve peak shift [rad].
+
+    Exact closed form (all orders in a_m/a_p, any monotone cloud profile):
+    the moon must reach maximum sky-plane elongation exactly as its cloud
+    crosses the stellar disk centre, which displaces the absorption peak by
+    the maximum possible +/- arcsin(a_m/a_p) of planet phase.
+
+        theta0* = 3*pi/2 - N*arcsin(a_m/a_p)   (branch='late',  peak after
+                                                mid-transit, trailing moon)
+        theta0* =   pi/2 + N*arcsin(a_m/a_p)   (branch='early', peak before
+                                                mid-transit, leading moon)
+
+    Both branches also sit on the flat |sin(theta0)| plateau of the
+    detectability (antisymmetric-RMS) curve, within <1% of its maximum.
+
+    Args:
+        planet (Planet): The host planet.
+        a_over_Rp (float): Moon semi-major axis in planet radii.
+        branch (str): 'late' or 'early' peak displacement.
+
+    Returns:
+        float: The optimal mid-transit moon phase [rad].
+    """
+    N = mean_motion_ratio(planet, a_over_Rp)
+    delta = np.arcsin(a_over_Rp * planet.R / planet.a)
+    if branch == 'late':
+        return float(3 * np.pi / 2 - N * delta)
+    if branch == 'early':
+        return float(np.pi / 2 + N * delta)
+    raise ValueError(f"branch must be 'late' or 'early', got {branch!r}")
+
+
+def max_peak_shift_minutes(planet: Planet, a_over_Rp: float = 1.7) -> float:
+    """Maximum achievable lightcurve peak displacement [minutes].
+
+    Delta_t = (T_p / 2 pi) arcsin(a_m/a_p): the time the planet takes to
+    traverse one moon-orbit radius in the sky.  This bound is attained at
+    :func:`optimal_midtransit_phase`.
+
+    Args:
+        planet (Planet): The host planet.
+        a_over_Rp (float): Moon semi-major axis in planet radii.
+
+    Returns:
+        float: The maximum peak shift [minutes].
+    """
+    delta = np.arcsin(a_over_Rp * planet.R / planet.a)
+    return float(delta / (2 * np.pi) * planet.orbitalPeriod * 24.0 * 60.0)

@@ -10,7 +10,8 @@ Created on 19. October 2021 by Andrea Gebek.
 
 import os
 from copy import deepcopy
-from typing import Any, Callable, List, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -2353,8 +2354,7 @@ class Transit:
         for i in range(0, len(chordGrid), batch_size):
             idx = slice(i, i + batch_size)
             
-            #  MODIFIED SECTION 
-            # If no spectrum is loaded, assume a flat star (flux = 1.0)
+            # Flat star (flux = 1.0) if no spectrum is loaded; otherwise Doppler-shifted PHOENIX lookup.
             if star.Fstar_function is None:
                 F_star_batch = np.ones((len(phi[idx]), n_wav))
             else:
@@ -2365,8 +2365,6 @@ class Transit:
                     star.Fstar_function.y, 
                     0.0
                 )
-            # 
-            
             if clv is None:
                 F_star_batch *= star.CLV_function(mu_term[idx],
                                                   self.wavelength)
@@ -2408,3 +2406,285 @@ class Transit:
                 np.add.at(F_out_sum, orb_indices[idx], F_out)
 
         return F_in_sum / F_out_sum
+
+
+"""
+High-level convenience API
+==========================
+
+Factory functions and a result wrapper that compose the classes above into a
+few-line transit calculation: build a wavelength grid, turn a particle number
+or mass-loss rate into a wired-up density distribution (constituent + line
+lookup attached), run the transit, and get the depth cube back as arrays with
+spectrum/lightcurve accessors.  All lengths are CGS.
+"""
+
+
+def na_d_grid(lower_ang: float = 5880.0, upper_ang: float = 5910.0,
+              widthHighRes: float = 4e-8, resolutionLow: float = 3e-9,
+              resolutionHigh: float = 2e-10) -> 'WavelengthGrid':
+    """A :class:`WavelengthGrid` spanning the Na-D doublet (defaults 5880-5910 A).
+
+    Args:
+        lower_ang, upper_ang (float): Wavelength bounds [Angstrom].
+        widthHighRes (float): High-res half-window around lines [cm].
+        resolutionLow, resolutionHigh (float): Pixel sizes outside / inside the
+            high-res window [cm].
+
+    Returns:
+        WavelengthGrid: The constructed wavelength grid.
+    """
+    return WavelengthGrid(
+        lower_w=lower_ang * 1e-8, upper_w=upper_ang * 1e-8,
+        widthHighRes=widthHighRes, resolutionLow=resolutionLow,
+        resolutionHigh=resolutionHigh)
+
+
+def line_grid(center_ang: float, half_window_ang: float = 15.0,
+              **kwargs) -> 'WavelengthGrid':
+    """A :class:`WavelengthGrid` centred on an arbitrary line [Angstrom].
+
+    Args:
+        center_ang (float): Line centre [Angstrom].
+        half_window_ang (float): Half-width of the grid window [Angstrom].
+        **kwargs: Forwarded to :func:`na_d_grid` (resolutions, high-res width).
+
+    Returns:
+        WavelengthGrid: The constructed wavelength grid.
+    """
+    return na_d_grid(lower_ang=center_ang - half_window_ang,
+                     upper_ang=center_ang + half_window_ang, **kwargs)
+
+
+def _attach_constituent(scenario: Any, species: str, sigma_v: float,
+                        wavelengthGrid: 'WavelengthGrid') -> Any:
+    """Adds an atomic constituent and its line lookup to a density distribution."""
+    scenario.addConstituent(species, sigma_v)
+    scenario.constituents[-1].addLookupFunctionToConstituent(wavelengthGrid)
+    return scenario
+
+
+def moon_exosphere_scenario(N: float, q: float, moon: Any, species: str,
+                            sigma_v: float,
+                            wavelengthGrid: 'WavelengthGrid') -> 'MoonExosphere':
+    """A :class:`MoonExosphere` (power-law density, normalised by ``N``).
+
+    Args:
+        N (float): Total tracer particle number.
+        q (float): Density power-law index (Io torus ~ 3.34).
+        moon (Any): A :class:`celestialBodies.Moon` object.
+        species (str): Species key (e.g. ``'NaI'``).
+        sigma_v (float): Velocity dispersion [cm/s].
+        wavelengthGrid (WavelengthGrid): The wavelength grid for the line lookup.
+
+    Returns:
+        MoonExosphere: The wired-up density distribution.
+    """
+    scen = MoonExosphere(N=N, q=q, moon=moon)
+    return _attach_constituent(scen, species, sigma_v, wavelengthGrid)
+
+
+def powerlaw_exosphere_scenario(N: float, q: float, planet: Any, species: str,
+                                sigma_v: float,
+                                wavelengthGrid: 'WavelengthGrid') -> 'PowerLawExosphere':
+    """A planet-centred :class:`PowerLawExosphere` normalised by ``N``.
+
+    Args:
+        N (float): Total tracer particle number.
+        q (float): Density power-law index.
+        planet (Any): A :class:`celestialBodies.Planet` object.
+        species (str): Species key (e.g. ``'NaI'``).
+        sigma_v (float): Velocity dispersion [cm/s].
+        wavelengthGrid (WavelengthGrid): The wavelength grid for the line lookup.
+
+    Returns:
+        PowerLawExosphere: The wired-up density distribution.
+    """
+    scen = PowerLawExosphere(N=N, q=q, planet=planet)
+    return _attach_constituent(scen, species, sigma_v, wavelengthGrid)
+
+
+def radial_wind_scenario(Mdot: float, planet: Any, species: str,
+                         sigma_v: float, wavelengthGrid: 'WavelengthGrid',
+                         mu: Optional[float] = None,
+                         wind_model: str = "parker", T: float = 1e4,
+                         wind_mu: Optional[float] = None,
+                         v_terminal: Optional[float] = None,
+                         beta: float = 1.0, v_base: Optional[float] = None,
+                         r_inner: Optional[float] = None,
+                         r_outer: Optional[float] = None) -> 'RadialWindExosphere':
+    """A :class:`RadialWindExosphere` normalised by mass continuity from ``Mdot``.
+
+    ``n(r) = Mdot / (4 pi r^2 v(r) mu)`` with either the exact isothermal Parker
+    wind (``wind_model='parker'``) or a beta-law velocity profile.
+
+    Args:
+        Mdot (float): Tracer mass-loss rate [g/s].
+        planet (Any): A :class:`celestialBodies.Planet` object.
+        species (str): Species key.
+        sigma_v (float): Velocity dispersion [cm/s].
+        wavelengthGrid (WavelengthGrid): The wavelength grid for the line lookup.
+        mu (Optional[float]): Tracer particle mass [g] (default: the species'
+            own mass).
+        wind_model (str): ``'parker'`` or ``'beta'``.
+        T (float): Isothermal wind temperature [K] (Parker dynamics).
+        wind_mu (Optional[float]): Bulk wind mean particle mass [g] for Parker
+            dynamics.
+        v_terminal, beta, v_base: beta-law parameters.
+        r_inner, r_outer (Optional[float]): Optional wind radial bounds [cm].
+
+    Returns:
+        RadialWindExosphere: The wired-up density distribution.
+    """
+    if mu is None:
+        # Default the tracer particle mass to the species' own mass.
+        mu = const.AvailableSpecies().findSpecies(species).mass
+    scen = RadialWindExosphere(
+        Mdot=Mdot, mu=mu, v_terminal=v_terminal, beta=beta,
+        r_inner=r_inner, r_outer=r_outer, v_base=v_base,
+        wind_model=wind_model, T=T, planet=planet, wind_mu=wind_mu)
+    return _attach_constituent(scen, species, sigma_v, wavelengthGrid)
+
+
+@dataclass
+class TransitResult:
+    """Result of a transit calculation, with spectrum/lightcurve accessors.
+
+    Attributes:
+        wavelength_cm (np.ndarray): Wavelength grid [cm], shape ``(n_wav,)``.
+        R_2D (np.ndarray): Transit-depth cube ``R(phase, lambda)``, shape
+            ``(n_phase, n_wav)``.
+        orbphase (np.ndarray): Orbital-phase axis [rad], shape ``(n_phase,)``.
+        planet (Any): The :class:`celestialBodies.Planet` used.
+    """
+
+    wavelength_cm: np.ndarray
+    R_2D: np.ndarray
+    orbphase: np.ndarray
+    planet: Any
+
+    #  axis conversions
+    @property
+    def wavelength_ang(self) -> np.ndarray:
+        """Wavelength grid [Angstrom]."""
+        return self.wavelength_cm * 1e8
+
+    @property
+    def wavelength_um(self) -> np.ndarray:
+        """Wavelength grid [micron]."""
+        return self.wavelength_cm * 1e4
+
+    #  transmission spectrum
+    def spectrum(self) -> np.ndarray:
+        """Phase-collapsed transit depth ``R(lambda)`` (median over phase)."""
+        return np.median(self.R_2D, axis=0)
+
+    def spectrum_normalized(self) -> np.ndarray:
+        """Transmission spectrum normalised to its continuum (max -> 1)."""
+        spec = self.spectrum()
+        return spec / spec.max()
+
+    #  derived line metrics
+    def _masks(self, line_window_ang, continuum_exclude_ang):
+        wav = self.wavelength_ang
+        lo, hi = line_window_ang
+        line_mask = (wav >= lo) & (wav <= hi)
+        if continuum_exclude_ang is None:
+            cont_mask = ~line_mask
+        else:
+            clo, chi = continuum_exclude_ang
+            cont_mask = (wav < clo) | (wav > chi)
+        return line_mask, cont_mask
+
+    def transit_depth(self,
+                      line_window_ang=(const.NA_D2_ANG - 4.0, const.NA_D2_ANG + 4.0),
+                      continuum_exclude_ang=(5884.0, 5902.0),
+                      mode: str = "peak") -> float:
+        """Excess absorption depth in a line window, vs a clean continuum.
+
+        Args:
+            line_window_ang: ``(lo, hi)`` line bandpass [Angstrom].
+            continuum_exclude_ang: ``(lo, hi)`` region to exclude from the
+                continuum estimate [Angstrom]; ``None`` uses everything outside
+                the line window.
+            mode (str): ``'peak'`` (deepest pixel, matches the Doppler-shifted
+                moon-cloud convention) or ``'mean'`` (band-averaged).
+
+        Returns:
+            float: Excess absorption as a fraction (multiply by 100 for percent).
+        """
+        spec = self.spectrum()
+        line_mask, cont_mask = self._masks(line_window_ang,
+                                           continuum_exclude_ang)
+        R_cont = np.median(spec[cont_mask])
+        if mode == "peak":
+            return float(1.0 - spec[line_mask].min() / R_cont)
+        elif mode == "mean":
+            return float(1.0 - spec[line_mask].mean() / R_cont)
+        raise ValueError(f"Unknown mode {mode!r}; use 'peak' or 'mean'.")
+
+    def lightcurve(self,
+                   line_window_ang=(const.NA_D2_ANG - 0.375, const.NA_D2_ANG + 0.375),
+                   continuum_exclude_ang=(5884.0, 5902.0),
+                   mode: str = 'mean') -> np.ndarray:
+        """Band-integrated lightcurve ``L(phase) = line / continuum``.
+
+        Values < 1 mark net excess absorption at that orbital phase.  Requires a
+        grid built with ``orbphase_steps > 1``.
+
+        Args:
+            line_window_ang: ``(lo, hi)`` line bandpass [Angstrom].
+            continuum_exclude_ang: continuum exclusion region [Angstrom].
+            mode (str): 'mean' for band-integrated flux, 'peak' for max line depth.
+
+        Returns:
+            np.ndarray: The lightcurve, shape ``(n_phase,)``.
+        """
+        line_mask, cont_mask = self._masks(line_window_ang,
+                                           continuum_exclude_ang)
+        cont_per_phase = np.mean(self.R_2D[:, cont_mask], axis=1)
+        if mode == 'mean':
+            line_per_phase = np.mean(self.R_2D[:, line_mask], axis=1)
+        elif mode == 'peak':
+            line_per_phase = np.min(self.R_2D[:, line_mask], axis=1)
+        else:
+            raise ValueError(f"Unknown mode {mode!r}; use 'peak' or 'mean'.")
+        return line_per_phase / cont_per_phase
+
+
+def run_transit(scenarios: List[Any], wavelengthGrid: 'WavelengthGrid',
+                spatialGrid: geom.Grid, hasOrbitalDopplerShift: bool = True,
+                use_phoenix_star: bool = True,
+                max_memory_gb: float = 4.0) -> TransitResult:
+    """Runs a full transit from a list of density distributions.
+
+    Builds the :class:`Atmosphere` / :class:`Transit`, constructs the wavelength
+    axis, optionally attaches the PHOENIX stellar spectrum, sums over chords, and
+    packages the depth cube into a :class:`TransitResult`.
+
+    Args:
+        scenarios (List[Any]): Density distributions (e.g. from
+            :func:`moon_exosphere_scenario`).  The host planet is taken from the
+            first one.
+        wavelengthGrid (WavelengthGrid): The wavelength grid.
+        spatialGrid (geom.Grid): The spatial/temporal grid.
+        hasOrbitalDopplerShift (bool): Apply the orbital + wind Doppler shift.
+        use_phoenix_star (bool): Attach the PHOENIX stellar spectrum
+            (``addFstarFunction``).  ``False`` uses a flat star (much faster;
+            fine for relative depths).
+        max_memory_gb (float): Memory cap passed to ``Transit.sumOverChords``.
+
+    Returns:
+        TransitResult: The transit-depth cube and its accessors.
+    """
+    atmos = Atmosphere(scenarios, hasOrbitalDopplerShift=hasOrbitalDopplerShift)
+    sim = Transit(atmos, wavelengthGrid, spatialGrid)
+    sim.addWavelength()
+    if use_phoenix_star:
+        sim.planet.hostStar.addFstarFunction(sim.wavelength)
+    R_2D = sim.sumOverChords(max_memory_gb=max_memory_gb)
+    orbphase = np.linspace(-spatialGrid.orbphase_border,
+                           spatialGrid.orbphase_border, R_2D.shape[0])
+    return TransitResult(wavelength_cm=np.asarray(sim.wavelength),
+                         R_2D=np.asarray(R_2D), orbphase=orbphase,
+                         planet=sim.planet)

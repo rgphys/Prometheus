@@ -16,14 +16,21 @@ c = 2.998e10
 G = 6.674*10**(-8)
 k_B = 1.381*10**(-16)
 amu = 1.661*10**(-24)
-R_J = 7.1492e9        #Jupiter radius # CHANGED TO EQUITORIAL RADIUS !!!!!!!
+R_J = 7.1492e9        # Jupiter equatorial radius
 M_J = 1.898e30      #Jupiter mass
 M_E = 5.974e27      #Earth mass
 R_sun = 6.96e10     # Solar radius
 M_sun = 1.988e33    # Solar mass
 R_Io = 1.822e8      # Io radius
-euler_mascheroni = 0.57721 
+euler_mascheroni = 0.57721
 AU = 1.496e13   # Conversion of one astronomical unit into cm
+
+# Na D doublet rest wavelengths [Angstrom], VACUUM values to match the vacuum
+# wavelengths in Resources/LineList.txt (Na D2 = 5891.583 A). The air values
+# (5889.95 / 5895.92) sit ~1.6 A off the computed lines, enough to push a narrow
+# bandpass off the absorption feature entirely.
+NA_D2_ANG = 5891.583   # Na D2 (3s -> 3p 2P_3/2), vacuum
+NA_D1_ANG = 5897.558   # Na D1 (3s -> 3p 2P_1/2), vacuum
 
 """
 Generally useful functions
@@ -35,7 +42,8 @@ def calculateDopplerShift(v: float) -> float:
 
     Args:
         v (float): The line-of-sight velocity in cm/s. Positive for motion
-            away from the observer (redshift).
+            toward the observer (blueshift): the returned factor is < 1, so
+            observed = factor * rest is shorter than the rest wavelength.
 
     Returns:
         float: The dimensionless Doppler shift factor.

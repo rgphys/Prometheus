@@ -62,6 +62,27 @@ Moon(midTransitOrbphase, R, a, hostPlanet)
 
 `midTransitOrbphase` (rad) is the moon's orbital phase relative to the planet at the planet's mid-transit; `R` (cm), `a` (moon semi-major axis around the planet, cm), `hostPlanet` (a `Planet`). Used with `MoonExosphere` / `TidallyHeatedMoon`.
 
+### Convenience constructors & moon orbital mechanics
+
+Module-level helpers that wrap the constructors above with research-sensible defaults.
+
+```python
+find_planet(name) -> Planet                 # like AvailablePlanets().findPlanet but RAISES if absent
+make_moon(planet, a_over_Rp=1.7, R=None, midTransitOrbphase=0.375*2*pi) -> Moon
+```
+
+`make_moon` places a moon at `a_over_Rp · planet.R`; `R` defaults to `const.R_Io`.
+
+Moon:planet orbital-mechanics relations (used to place a moon for transit; all take `a_over_Rp`, so they can be evaluated *before* a `Moon` exists):
+
+```python
+mean_motion_ratio(planet, a_over_Rp=1.7) -> float        # N = sqrt(a_p^3 M_p / (a_m^3 M_*))
+optimal_midtransit_phase(planet, a_over_Rp=1.7, branch='late') -> float   # rad; maximises peak shift
+max_peak_shift_minutes(planet, a_over_Rp=1.7) -> float   # max lightcurve peak displacement [min]
+```
+
+`optimal_midtransit_phase` returns the moon phase at mid-transit that maximises the moon's sky-plane displacement (`branch='late'` → peak after mid-transit; `'early'` → before). See `Tests/midtransit_phase_proof.tex`.
+
 ---
 
 ## `geometryHandler`
@@ -87,6 +108,16 @@ Grid(x_midpoint, x_border, x_steps,
 
 Useful methods: `getChordGrid()` (flattened `(N,3)` of `(phi, rho, orbphase)`), `constructXaxis()`, `constructRhoAxis()`, `constructPhiAxis()`, `constructOrbphaseAxis()`, `getDeltaX()`, `getDeltaRho()`, `getDeltaPhi()`.
 
+### Grid convenience builders
+
+```python
+spatial_grid(planet, x_border_Rp=12.0, x_steps=25, rho_steps=60, phi_steps=30,
+             orbphase_window=0.0, orbphase_steps=1, rho_border=None) -> Grid
+orbphase_window_from_hours(planet, half_window_hours) -> float   # hours → rad half-window
+```
+
+`spatial_grid` builds a `Grid` tuned for an extended exosphere: chord centred on `planet.a`, and `rho_border` defaults to the **stellar radius** (depth normalises by the stellar disk — do not shrink it). `orbphase_window` is the orbital-phase half-window (0 → single mid-transit phase; `>0` with `orbphase_steps>1` → a lightcurve), conveniently produced from a `±hours` window by `orbphase_window_from_hours`.
+
 ---
 
 ## `gasProperties`
@@ -105,6 +136,14 @@ WavelengthGrid(lower_w, upper_w, widthHighRes, resolutionLow, resolutionHigh)
 | `resolutionHigh` | Step size inside the high-resolution regions (cm). |
 
 The grid array itself is built by `Transit.addWavelength()` → `constructWavelengthGrid`: fine sampling near atomic lines, coarse elsewhere. If there are no atomic lines in range, a uniform `resolutionLow` grid is returned. Molecular/continuum opacities do not add grid points.
+
+Convenience builders (bounds in Å):
+
+```python
+na_d_grid(lower_ang=5880.0, upper_ang=5910.0, widthHighRes=4e-8,
+          resolutionLow=3e-9, resolutionHigh=2e-10) -> WavelengthGrid   # Na D doublet window
+line_grid(center_ang, half_window_ang=15.0, **kwargs) -> WavelengthGrid # centred on any line
+```
 
 ---
 
@@ -195,6 +234,21 @@ RadialWindExosphere(Mdot, mu, v_terminal=None, beta=1.0,
 | `wind_mu` | Bulk-gas mean mass (g) fixing the Parker **dynamics**; defaults to `mu`. Use it to advect a trace species in a light (H/He) outflow. |
 
 For `wind_model='parker'`, the object exposes `c_s` (sound speed), `r_c` (sonic radius), and `_wind_velocity(r)` (the analytic velocity profile). When orbital Doppler shifting is on, `calculateLOSVelocity(...)` is invoked automatically to apply a position-dependent Doppler shift. See [architecture.md](architecture.md#radial-wind-physics).
+
+#### Scenario builders
+
+Factory functions that construct an evaporative exosphere **and** attach its atomic constituent + line-lookup in one call (so the returned object is ready to drop into `Atmosphere`):
+
+```python
+moon_exosphere_scenario(N, q, moon, species, sigma_v, wavelengthGrid) -> MoonExosphere
+powerlaw_exosphere_scenario(N, q, planet, species, sigma_v, wavelengthGrid) -> PowerLawExosphere
+radial_wind_scenario(Mdot, planet, species, sigma_v, wavelengthGrid,
+                     mu=None, wind_model='parker', T=1e4, wind_mu=None,
+                     v_terminal=None, beta=1.0, v_base=None,
+                     r_inner=None, r_outer=None) -> RadialWindExosphere
+```
+
+`species` is a key like `'NaI'`; `sigma_v` the velocity dispersion (cm/s). For `radial_wind_scenario`, `mu` defaults to the species' own atomic mass.
 
 ---
 
@@ -288,11 +342,43 @@ depth_ppm = (1.0 - R[0]) * 1e6          # single mid-transit spectrum
 wavelength_um = sim.wavelength * 1e4
 ```
 
+### `run_transit` and `TransitResult`
+
+A one-call wrapper around the `Atmosphere` → `Transit` → `sumOverChords` reduction, returning a `TransitResult` with spectrum/lightcurve accessors:
+
+```python
+run_transit(scenarios, wavelengthGrid, spatialGrid,
+            hasOrbitalDopplerShift=True, use_phoenix_star=True,
+            max_memory_gb=4.0) -> TransitResult
+```
+
+- `scenarios` — list of density distributions (e.g. from the scenario builders); the host planet is taken from the first.
+- `use_phoenix_star=False` uses a flat star (much faster; fine for relative depths).
+
+`TransitResult` (a dataclass) carries `wavelength_cm`, `R_2D` (`(n_phase, n_wav)`), `orbphase`, `planet`, with:
+
+| Member | Returns |
+|---|---|
+| `wavelength_ang` / `wavelength_um` | Wavelength axis in Å / µm. |
+| `spectrum()` | Phase-collapsed `R(λ)` (median over phase). |
+| `spectrum_normalized()` | Spectrum / its continuum max. |
+| `transit_depth(line_window_ang=…, continuum_exclude_ang=…, mode='peak')` | Excess absorption fraction vs continuum (`mode='peak'` or `'mean'`). |
+| `lightcurve(line_window_ang=…, continuum_exclude_ang=…, mode='mean')` | Band line/continuum vs phase (needs `orbphase_steps>1`). |
+
+Window defaults are centred on the vacuum Na D2 line (`const.NA_D2_ANG`).
+
+```python
+scen = gasprop.moon_exosphere_scenario(N=5e33, q=3.34, moon=moon,
+                                       species='NaI', sigma_v=2e6, wavelengthGrid=wg)
+res  = gasprop.run_transit([scen], wg, sg, use_phoenix_star=False)
+depth_pct = res.transit_depth() * 100.0
+```
+
 ---
 
 ## `constants`
 
-Physical constants (cgs): `e`, `m_e`, `c`, `G`, `k_B`, `amu`, `R_J`, `M_J`, `M_E`, `R_sun`, `M_sun`, `R_Io`, `AU`.
+Physical constants (cgs): `e`, `m_e`, `c`, `G`, `k_B`, `amu`, `R_J`, `M_J`, `M_E`, `R_sun`, `M_sun`, `R_Io`, `AU`. Na D doublet rest wavelengths (Å, **vacuum**, matching `LineList.txt`): `NA_D2_ANG` (5891.583), `NA_D1_ANG` (5897.558).
 
 - `calculateDopplerShift(v)` — relativistic Doppler factor for line-of-sight velocity `v` (cm/s).
 - `AvailableSpecies().findSpecies(name)` / `.listSpeciesNames()` — the atomic/ionic catalog. Built-in species include `NaI`, `KI`, `SiI`–`SiIV`, `MgI`/`MgII`, `AlI`, `CaI`/`CaII`, `TiI`/`TiII`, `CrI`, `MnI`, `FeI`, `CoI`, `NiI`, `OI`, `CII`, `SIII`, `SIV`.
