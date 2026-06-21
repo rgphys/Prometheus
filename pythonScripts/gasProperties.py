@@ -382,20 +382,49 @@ class HydrostaticAtmosphere(CollisionalAtmosphere):
 
 
 class NonIsothermalHydrostaticAtmosphere(CollisionalAtmosphere):
-    """Hydrostatic atmosphere with a power-law temperature-pressure profile.
+    """Hydrostatic atmosphere with a power-law (polytropic) temperature-pressure profile.
 
         T(P) = T_ref * (P / P_0) ** beta,   beta >= 0  (cooler aloft, hotter deep)
 
-    beta = 0 recovers the isothermal HydrostaticAtmosphere.  The radial pressure
-    structure is obtained by integrating hydrostatic equilibrium with altitude-
-    dependent g(r) = G M / r^2:
+    A fixed exponent beta relating T to P is the defining closure of a *polytropic*
+    atmosphere.  beta is a free model parameter (an ASSUMPTION, not a measured
+    quantity); the physically special value beta = R/c_p = (gamma-1)/gamma
+    (~0.286 for a diatomic gas) is the dry adiabat.  beta = 0 recovers the
+    isothermal HydrostaticAtmosphere.
 
-        d ln P / dr = - mu G M / (k_B T(P) r^2),
+    The radial structure follows from hydrostatic equilibrium with point-mass
+    gravity g(r) = G M / r^2 and the ideal gas law (rho = n*mu = P*mu/(k_B T)):
 
-    inward-consistent with P(R_p) = P_0.  Density n(r) = P(r) / (k_B T(r)) and
-    the local temperature T(r) are tabulated on a fine radial grid at init and
-    interpolated.  Molecular cross-sections are then evaluated at the LOCAL
-    T(r) along each line of sight (see getLOSopticalDepth_Batch).
+        d ln P / dr = - mu G M / (k_B T(P) r^2),                              (1)
+
+    inward-consistent with P(R_p) = P_0.  This class integrates (1) numerically
+    (so it can apply the T_min isothermal floor aloft), but with that floor
+    removed it has an exact closed form.  Substituting T = T_ref (P/P_0)^beta
+    into (1), letting u = P/P_0 and c0 = mu G M / k_B, gives the separable ODE
+    u^(beta-1) du = -(c0/T_ref) dr/r^2, which integrates from u(R_p)=1 to:
+
+        P(r)/P_0 = [ 1 + (beta c0 / T_ref) (1/r - 1/R_p) ] ** (1/beta)        (2)
+        T(r)     = T_ref + beta c0 (1/r - 1/R_p)                              (3)
+
+    i.e. the temperature is LINEAR in the gravitational potential Phi = -GM/r.
+    (Eqs. (2)-(3) verified symbolically against (1): ODE residual identically 0.)
+    As beta -> 0, (2) limits to the isothermal exponential of HydrostaticAtmosphere.
+
+    References (power-law / polytropic T-P closure):
+      * Chandrasekhar (1939), An Introduction to the Study of Stellar Structure,
+        ch. IV (polytropes; T propto P with fixed exponent).
+      * Madhusudhan & Seager (2009), ApJ 707, 24, doi:10.1088/0004-637X/707/1/24
+        (parametric power-law T-P layers for exoplanet-atmosphere retrieval).
+      * Guillot (2010), A&A 520, A27, doi:10.1051/0004-6361/200913396; extended
+        non-grey by Parmentier & Guillot (2014), A&A 562, A133
+        (analytic irradiated-atmosphere T-P profiles this beta-model approximates).
+      * Dry-adiabat special case: Pierrehumbert (2010), Principles of Planetary
+        Climate, ch. 2; Catling & Kasting (2017).
+
+    Density n(r) = P(r) / (k_B T(r)) and the local temperature T(r) are tabulated
+    on a fine radial grid at init and interpolated.  Molecular cross-sections are
+    then evaluated at the LOCAL T(r) along each line of sight (see
+    getLOSopticalDepth_Batch).
 
     Attributes:
         isNonIsothermal (bool): marks the per-cell-temperature opacity path.
