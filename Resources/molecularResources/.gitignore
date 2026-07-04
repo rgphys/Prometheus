@@ -1,0 +1,10 @@
+# ExoMol opacity tables are ~365 MB each (~2.5 GB total) -- too large to commit.
+# Fetch them with fetch_opacities.py instead.
+*.h5
+*.h5.part
+
+# Keep the fetcher, its docs, and the recorded checksums.
+!fetch_opacities.py
+!README.md
+!.gitignore
+!checksums.sha256
