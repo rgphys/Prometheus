@@ -1,12 +1,12 @@
 # API reference
 
-All public classes live in the `pythonScripts` package. Constructor signatures and argument names below are taken directly from the source. Units are **cgs** throughout: wavelengths in cm, pressures in barye, lengths in cm, velocities in cm/s, masses in g, temperatures in K.
+All public classes live in the `core` package. Constructor signatures and argument names below are taken directly from the source. Units are **cgs** throughout: wavelengths in cm, pressures in barye, lengths in cm, velocities in cm/s, masses in g, temperatures in K.
 
 ```python
-import pythonScripts.gasProperties as gasprop
-import pythonScripts.celestialBodies as bodies
-import pythonScripts.geometryHandler as geom
-import pythonScripts.constants as const
+import core.gasProperties as gasprop
+import core.celestialBodies as bodies
+import core.geometryHandler as geom
+import core.constants as const
 ```
 
 ---

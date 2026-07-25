@@ -89,7 +89,7 @@ Results are saved to `../output/<setup_name>.txt` with the format:
 
 ```
 Prometheus/
-├ pythonScripts/
+├ core/
 │   ├ setup.py           # Interactive setup file generator
 │   ├ gasProperties.py   # Atmosphere/exosphere models, scattering, transit computation
 │   ├ celestialBodies.py # Planet & moon definitions

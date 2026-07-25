@@ -1,15 +1,15 @@
 # Examples
 
-These worked examples are simplified and annotated versions of the figure scripts that ship with the project (`fig*.py`). Each builds a simulation purely from Python objects — no configuration files. All examples assume the `pythonScripts` package is importable (see [getting-started.md](getting-started.md#installation)).
+These worked examples are simplified and annotated versions of the figure scripts that ship with the project (`fig*.py`). Each builds a simulation purely from Python objects — no configuration files. All examples assume the `core` package is importable (see [getting-started.md](getting-started.md#installation)).
 
 Common imports:
 
 ```python
 import numpy as np
-import pythonScripts.gasProperties as gasprop
-import pythonScripts.celestialBodies as bodies
-import pythonScripts.geometryHandler as geom
-import pythonScripts.constants as const
+import core.gasProperties as gasprop
+import core.celestialBodies as bodies
+import core.geometryHandler as geom
+import core.constants as const
 ```
 
 ---

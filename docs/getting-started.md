@@ -40,19 +40,19 @@ pip install numpy scipy numba h5py astropy psutil
 pip install matplotlib pandas
 ```
 
-Prometheus is imported as the `pythonScripts` package from the repository root. The simplest way to make it importable is to run your scripts from the repo root, or to prepend the repo root to `sys.path`:
+Prometheus is imported as the `core` package from the repository root. The simplest way to make it importable is to run your scripts from the repo root, or to prepend the repo root to `sys.path`:
 
 ```python
 import sys, os
-sys.path.insert(0, '/path/to/Prometheus')   # directory containing pythonScripts/
+sys.path.insert(0, '/path/to/Prometheus')   # directory containing core/
 
-import pythonScripts.gasProperties as gasprop
-import pythonScripts.celestialBodies as bodies
-import pythonScripts.geometryHandler as geom
-import pythonScripts.constants as const
+import core.gasProperties as gasprop
+import core.celestialBodies as bodies
+import core.geometryHandler as geom
+import core.constants as const
 ```
 
-If you prefer an editable install, add a `pyproject.toml`/`setup.cfg` that exposes the `pythonScripts` package and run `pip install -e .`; the import paths above remain unchanged.
+If you prefer an editable install, add a `pyproject.toml`/`setup.cfg` that exposes the `core` package and run `pip install -e .`; the import paths above remain unchanged.
 
 ### Data resources
 
@@ -75,7 +75,7 @@ Prometheus works internally in **cgs**. The conventions you will encounter most 
 - Number densities in **cm⁻³**, lengths in **cm**, velocities in **cm/s**, masses in **g**.
 - Mean molecular weight `mu` is a **mass in grams**, so write it as a multiple of `const.amu` (e.g. `2.3 * const.amu`).
 
-Helpful constants live in `pythonScripts.constants`: `amu`, `k_B`, `G`, `c`, `R_J`, `M_J`, `R_sun`, `M_sun`, `R_Io`, `AU`.
+Helpful constants live in `core.constants`: `amu`, `k_B`, `G`, `c`, `R_J`, `M_J`, `R_sun`, `M_sun`, `R_Io`, `AU`.
 
 ---
 
@@ -92,10 +92,10 @@ assembled into a **`Transit`** that you run with `sumOverChords`.
 
 ```python
 import numpy as np
-import pythonScripts.gasProperties as gasprop
-import pythonScripts.celestialBodies as bodies
-import pythonScripts.geometryHandler as geom
-import pythonScripts.constants as const
+import core.gasProperties as gasprop
+import core.celestialBodies as bodies
+import core.geometryHandler as geom
+import core.constants as const
 
 # 1. Planet from the built-in catalog (also loads its host star).
 planet = bodies.AvailablePlanets().findPlanet('WASP-39b')

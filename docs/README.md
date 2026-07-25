@@ -57,10 +57,10 @@ The API is **fully programmatic**: you build a simulation by constructing Python
 ## A minimal run
 
 ```python
-import pythonScripts.gasProperties as gasprop
-import pythonScripts.celestialBodies as bodies
-import pythonScripts.geometryHandler as geom
-import pythonScripts.constants as const
+import core.gasProperties as gasprop
+import core.celestialBodies as bodies
+import core.geometryHandler as geom
+import core.constants as const
 
 planet = bodies.AvailablePlanets().findPlanet('WASP-39b')
 

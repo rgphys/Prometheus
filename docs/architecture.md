@@ -6,7 +6,7 @@ This page describes how Prometheus is organized and how a transmission spectrum 
 
 ## Modules
 
-All code lives in the `pythonScripts` package:
+All code lives in the `core` package:
 
 | Module | Responsibility |
 |---|---|
@@ -16,7 +16,7 @@ All code lives in the `pythonScripts` package:
 | `gasProperties.py` | The bulk of the physics: density models (atmospheres and exospheres), absorber/scatterer constituents, the `Atmosphere` aggregator, the `WavelengthGrid`, the Numba optical-depth kernels, and the `Transit` orchestrator. |
 | `memoryHandler.py` | Memory-aware batching: estimates per-chord memory and picks a chunk size that fits within a RAM budget. |
 
-The example figure scripts (`fig*.py`) import only from `pythonScripts.*` for the Prometheus physics; some additionally use the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository.
+The example figure scripts (`fig*.py`) import only from `core.*` for the Prometheus physics; some additionally use the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository.
 
 ---
 

@@ -10,8 +10,8 @@ Created on 2. June 2021 by Andrea Gebek.
 import numpy as np
 import json
 import sys
-import pythonScripts.constants as const
-import pythonScripts.celestialBodies as bodies
+import core.constants as const
+import core.celestialBodies as bodies
 
 
 class NumericalQuestion:

@@ -21,7 +21,7 @@ the water file uses ``__R15000`` (double underscore) where every other
 molecule uses ``.R15000`` -- this asymmetry is on the ExoMol side.
 
 Prometheus loads these as ``<molecule>.h5`` (see MolecularConstituent in
-``pythonScripts/gasProperties.py``), so each download is saved under its
+``core/gasProperties.py``), so each download is saved under its
 short molecule name, e.g. ``1H2-16O__POKAZATEL...h5`` -> ``H2O.h5``.
 
 Usage

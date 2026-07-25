@@ -6,7 +6,7 @@ Prometheus is a research code, and contributions — new density models, additio
 
 ## Development setup
 
-Prometheus has no build step: it is a plain Python package (`pythonScripts`) imported from the repository root. To work on it, clone the repo and install the runtime dependencies into a virtual environment.
+Prometheus has no build step: it is a plain Python package (`core`) imported from the repository root. To work on it, clone the repo and install the runtime dependencies into a virtual environment.
 
 ```bash
 git clone https://github.com/rgphys/Prometheus.git
@@ -20,7 +20,7 @@ pip install numpy scipy numba h5py astropy psutil
 pip install matplotlib pandas
 ```
 
-The package is imported as `pythonScripts.*` (see [getting-started.md](getting-started.md#installation)). Run your scripts from the repository root, or prepend the repo root to `sys.path`, so that `import pythonScripts.gasProperties` resolves. The physics data in `Resources/` is located relative to the package automatically — no configuration is required.
+The package is imported as `core.*` (see [getting-started.md](getting-started.md#installation)). Run your scripts from the repository root, or prepend the repo root to `sys.path`, so that `import core.gasProperties` resolves. The physics data in `Resources/` is located relative to the package automatically — no configuration is required.
 
 ---
 
@@ -33,7 +33,7 @@ python fig1_model_zoo.py
 python fig8_molecular_jwst-8.py
 ```
 
-Some figures (`fig2`, `fig4`, `fig9`, `fig10`, `fig11`) additionally depend on the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository; the Prometheus-only figures (`fig1`, `fig3`, `fig6`, `fig7`, `fig8`) run against `pythonScripts.*` alone.
+Some figures (`fig2`, `fig4`, `fig9`, `fig10`, `fig11`) additionally depend on the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository; the Prometheus-only figures (`fig1`, `fig3`, `fig6`, `fig7`, `fig8`) run against `core.*` alone.
 
 When you add a feature, the lightest-weight check is to build a small simulation directly from Python objects — a single planet, one density model, a narrow `WavelengthGrid`, and a coarse `Grid` — and confirm `Transit.sumOverChords` returns a sensible spectrum. Keep `max_memory_gb` small (e.g. `0.1–0.5`) for quick iterations.
 

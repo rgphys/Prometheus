@@ -31,7 +31,7 @@ that it can be slotted into any post-processing pipeline.
 
 Usage overview
 --
->>> from Prometheus.pythonScripts.shotNoise import SNRModel, apply_shot_noise
+>>> from Prometheus.core.shotNoise import SNRModel, apply_shot_noise
 >>>
 >>> snr_model = SNRModel.constant(snr_per_bin=847.0)
 >>> noisy_spec, sigma = apply_shot_noise(wavelength, spectrum, snr_model)
@@ -349,7 +349,7 @@ def bin_to_resolution(wavelength: np.ndarray,
     """Resample a model onto a constant resolving-power instrument grid.
 
     Prometheus builds a deliberately *non-uniform* wavelength grid (see
-    :class:`~pythonScripts.gasProperties.WavelengthGrid`): a fine step
+    :class:`~core.gasProperties.WavelengthGrid`): a fine step
     (``resolutionHigh``) only within ``widthHighRes`` of each line and a coarse
     step (``resolutionLow``) in the continuum.  A real spectrograph instead
     samples at a roughly *constant* resolving power ``R = lambda / d_lambda`` —

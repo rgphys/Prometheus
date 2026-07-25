@@ -1,7 +1,7 @@
 # Molecular opacity tables
 
 Prometheus reads molecular absorption from ExoMol cross-section tables in this
-directory (`MolecularConstituent`, `pythonScripts/gasProperties.py`). Each
+directory (`MolecularConstituent`, `core/gasProperties.py`). Each
 `<molecule>.h5` holds sigma(P, T, lambda) at **R = 15000** over **0.3–50 µm**,
 on a **22-point pressure** grid (1e-5–100 bar) × **27-point temperature** grid
 (100–3400 K). These are **cross sections**, not correlated-k tables.
