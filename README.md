@@ -21,6 +21,9 @@ PRObing Mass loss in Exoplanetary Transits with Hydrostatic, Evaporative and Use
   - Power-law aerosol (`PowerLawAerosol`) — Ångström exponent parameterization
   - Tabulated aerosol (`TabulatedAerosol`) — cross-sections from a user-supplied CSV file
 - **Doppler orbital motion** correction (bulk) and **position-dependent wind velocity** Doppler shifts for radial wind models
+- **Secondary eclipses** (`eclipse.py`) — dayside thermal emission integrated over a planet-centred ray grid, with an opaque surface boundary and any overlying gas, returning `F_planet/F_star`. Calibrated against the JWST/MIRI eclipse of 55 Cnc e; see `Tests/EmissionCalibration/`
+- **Arbitrary stellar spectra** via `Star.addFstarFunctionFromArrays` — required in the mid-infrared, where the bundled PHOENIX HiRes grid stops (~5.5 um)
+- **Emission physics** (optional, via `emission.EmissionModel`) — resonance scattering of starlight by the line opacity, LTE thermal emission, and isotropic aerosol scattering, solved as a source term in the formal radiative-transfer solution rather than pure Beer-Lambert extinction. Includes parcel-frame stellar illumination, so gas sitting in a stellar Fraunhofer core scatters weakly while Doppler-shifted gas scatters strongly
 - **Vectorized computation** via NumPy broadcasting and Numba-accelerated interpolation; no Python loops over individual chords
 - **Memory-aware batching** via `memoryHandler.py` — chords are processed in chunks sized to stay within a configurable RAM limit
 - **Configurable memory limits** via `--max-memory` flag
@@ -29,6 +32,12 @@ PRObing Mass loss in Exoplanetary Transits with Hydrostatic, Evaporative and Use
 > **Note:** The core computation path is fully vectorized using NumPy and Numba JIT kernels. Python `multiprocessing` is imported but not used in the active computation path; the import is a legacy artifact.
 
 ---
+
+> **Molecular opacity pressure units (fixed 2026-09-11).** The ExoMolOP tables
+> store pressure in bar; the loader was converting as if it were Pascals,
+> clamping every atmosphere to the 100 bar cross-section. Molecular results
+> computed before this date are affected — see
+> `Resources/molecularResources/README.md` for the measured impact.
 
 ## Requirements
 
@@ -94,6 +103,8 @@ Prometheus/
 │   ├ gasProperties.py   # Atmosphere/exosphere models, scattering, transit computation
 │   ├ celestialBodies.py # Planet & moon definitions
 │   ├ geometryHandler.py # Spatial grid and chord geometry
+│   ├ emission.py        # Emission source functions, dilution, g-factor
+│   ├ eclipse.py         # Secondary-eclipse geometry and dayside surface
 │   ├ memoryHandler.py   # Memory-aware chunk processing
 │   └ constants.py       # Physical constants & available species
 ├ Resources/             # Cross-section and species data

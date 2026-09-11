@@ -243,3 +243,145 @@ phases_rad = s_grid.constructOrbphaseAxis()
 ```
 
 Each row `R_2D[i]` is the spectrum at orbital phase `phases_rad[i]`; integrating a row over a line bandpass yields a light-curve point, and stacking rows gives a velocity-vs-phase transmission map.
+
+---
+
+## 5. Resonance-scattering emission from an exomoon cloud
+
+Everything above solves pure extinction. Passing an `EmissionModel` adds the
+photons the gas scatters *back* into the beam: in transit they partially refill
+the line core, and outside the stellar limb the cloud glows against the dark
+sky. See [architecture.md](architecture.md#emission) for the radiative transfer
+and its stated approximations.
+
+```python
+import core.emission as emis
+
+planet = bodies.AvailablePlanets().findPlanet('WASP-49b')
+moon   = bodies.Moon(midTransitOrbphase=0.0, R=const.R_Io,
+                     a=5.0 * planet.R, hostPlanet=planet)
+
+wg   = gasprop.na_d_grid(5885.0, 5905.0)
+scen = gasprop.moon_exosphere_scenario(N=5e33, q=3.34, moon=moon,
+                                       species='NaI', sigma_v=2e6,
+                                       wavelengthGrid=wg)
+
+# Widen the sky plane past the stellar limb so the off-limb glow is captured.
+# Chords outside the limb receive no photospheric flux, so the transmission
+# spectrum is unaffected -- they only add emission.
+sg = geom.spatial_grid(planet, rho_steps=120, phi_steps=40,
+                       rho_border=2.0 * planet.hostStar.R)
+
+model = emis.EmissionModel(resonant_scattering=True)
+res = gasprop.run_transit([scen], wg, sg, use_phoenix_star=True,
+                          emission=model)
+
+depth = res.transit_depth() * 100.0          # % excess absorption, net of fill-in
+glow  = res.emission_spectrum().max()        # peak emission, in stellar-flux units
+print(f"{depth:.3f} % absorption, {glow*1e6:.1f} ppm peak emission, "
+      f"{res.fill_in_fraction()*100:.2f} % of the absorption refilled")
+```
+
+For a hot Jupiter the fill-in is small — the star subtends only
+`W = (R_star/a)²/4 ≈ 4e-3` of the sky at the planet, so scattering returns a few
+tenths of a percent of what absorption removes. That is a useful result in
+itself: it is the quantitative justification for treating a transit as pure
+absorption. The emission term matters where the denominator is small — off the
+stellar disk, out of transit, and at high spectral resolution.
+
+To see the two effects separately:
+
+```python
+atm = gasprop.Atmosphere([scen], hasOrbitalDopplerShift=True, emission=model)
+sim = gasprop.Transit(atm, wg, sg); sim.addWavelength()
+sim.planet.hostStar.addFstarFunction(sim.wavelength, extra_velocity=1e7)
+parts = sim.sumOverChords(return_components=True)
+# parts['R'] == parts['transmission'] + parts['emission']
+```
+
+**The stellar line trap.** With `stellar_doppler=True` (the default) each parcel
+samples the stellar spectrum in *its own* frame. Gas at rest relative to the
+star sits inside the stellar Na D core and is barely illuminated; gas that has
+been Doppler-shifted out of the core sees the full continuum and scatters far
+more. The `g_factor` diagnostic makes this concrete:
+
+```python
+c = scen.constituents[0]
+star = planet.hostStar
+star.addFstarFunction(np.array([5885e-8, 5905e-8]), extra_velocity=2e6)
+for v_kms in (0.0, 5.0, 15.0):
+    g = emis.g_factor(c, star, planet.a, v_radial=v_kms * 1e5)
+    print(f"v_rad = {v_kms:5.1f} km/s -> g = {g:8.2f} photons/s/atom")
+```
+
+Only `RadialWindExosphere` supplies a star-radial velocity field to the transfer
+(`calculateRadialVelocityFromStar`); other models are treated as moving
+perpendicular to the star direction, which is exact for a circular orbit.
+
+**Thermal emission** is the other source term, off by default:
+
+```python
+model = emis.EmissionModel(resonant_scattering=False, thermal=True)
+```
+
+It uses `B_λ(T)` from the density model's temperature field, so only the
+`CollisionalAtmosphere` family contributes. At optical wavelengths against a
+main-sequence host it is negligible; it becomes relevant in the infrared and for
+hot, dense gas.
+
+---
+
+## 6. Secondary eclipse of a lava planet
+
+Emission's other observable: the planet's own dayside flux, `F_p/F_*`, rather
+than the starlight it blocks. This uses a planet-centred ray grid
+(`eclipse.py`) instead of the star-centred chord grid.
+
+```python
+import core.eclipse as ecl
+
+planet = bodies.AvailablePlanets().findPlanet('55-Cancri-e')
+star   = planet.hostStar
+
+# The PHOENIX HiRes grid stops near 5.5 um, so attach a spectrum that reaches
+# the mid-IR.  Skipping this falls back to a blackbody at T_eff, which
+# over-predicts a G8V photosphere at 6-12 um by ~13%.
+w_cm, I_cgs = np.loadtxt('btsettl.csv', delimiter=',', skiprows=1, unpack=True)
+star.addFstarFunctionFromArrays(w_cm, I_cgs)
+
+wav = np.linspace(6.0e-4, 12.0e-4, 400)          # 6-12 um, in cm
+e = ecl.Eclipse(planet, wav,
+                surface=ecl.DaysideSurface(T_day=2000.0, profile='uniform'))
+
+print(e.bandDepth(6.3e-4, 11.8e-4) * 1e6, 'ppm')   # band-averaged, ppm
+```
+
+Going the other way — turning a *measured* eclipse depth into the temperature a
+model has to reproduce:
+
+```python
+T_b = ecl.band_brightness_temperature(planet, wav, 110e-6, 6.3e-4, 11.8e-4)
+```
+
+Add gas above the surface by passing an `Atmosphere` built with an
+`EmissionModel`; rays then carry
+`epsilon·B_λ(T_surf)·exp(-tau_above) + I_gas`, and rays outside the solid body
+see only the limb:
+
+```python
+atmos = gasprop.Atmosphere([layer], hasOrbitalDopplerShift=False,
+                           emission=emis.EmissionModel(resonant_scattering=False,
+                                                       thermal=True,
+                                                       aerosol_albedo=0.0))
+e = ecl.Eclipse(planet, wav, surface=surface, atmosphere=atmos,
+                R_top=1.2 * planet.R)
+```
+
+Note `aerosol_albedo=0.0`: aerosol extinction is split by the albedo into a
+scattering share and a true-absorption share, and only the absorbing share
+emits thermally. A grey opacity meant as an absorber needs albedo 0, or it will
+remove flux without putting any back.
+
+The dayside temperature is an input here, not a prediction — Prometheus has no
+energy-balance solver. `Tests/EmissionCalibration/` runs this against the
+JWST/MIRI eclipse of 55 Cnc e and works through the error budget.

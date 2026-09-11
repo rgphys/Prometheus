@@ -54,6 +54,15 @@ Obtained via `planet.hostStar`. Attributes include `R`, `M`, `T_eff`, `log_g`, `
 
 If `addFstarFunction` is never called, the star is treated as a flat continuum (`F_star = 1`), which is faster.
 
+#### Stellar spectra
+
+| Method | Purpose |
+|---|---|
+| `addFstarFunction(wavelength, extra_velocity=0.0)` | Download (and cache) the PHOENIX HiRes spectrum and attach it. `extra_velocity` [cm/s] widens the retained range, needed when the spectrum is sampled in a moving parcel's frame. |
+| `addFstarFunctionFromArrays(wavelength, intensity)` | Attach any spectrum: `wavelength` [cm] strictly increasing, `intensity` the **surface specific intensity** [erg s⁻¹ cm⁻² cm⁻¹ sr⁻¹] = surface flux / π, matching `getSpectrum`'s convention. Required for mid-infrared work — PHOENIX HiRes stops near 5.5 µm. |
+
+---
+
 ### `Moon`
 
 ```python
@@ -304,15 +313,21 @@ atm.addScatteringConstituent('RayleighHaze',
 ### `Atmosphere`
 
 ```python
-Atmosphere(densityDistributionList, hasOrbitalDopplerShift)
+Atmosphere(densityDistributionList, hasOrbitalDopplerShift, emission=None)
 ```
 
 Wraps a list of one or more density models and owns the optical-depth computation.
 
 - `densityDistributionList` — e.g. `[atm]` or `[hydrostatic, wind]`.
 - `hasOrbitalDopplerShift` — `True` to apply orbital (and, for wind models, position-dependent) Doppler shifts; `False` for fast continuum-dominated runs.
+- `emission` — an `emission.EmissionModel` to solve with a source term (resonance scattering / thermal emission) instead of pure Beer–Lambert extinction. `None` (default) is the pure-extinction path, bit-for-bit unchanged.
 
-Key method (called internally by `Transit`): `getLOSopticalDepth_Batch(x_grid, phi_batch, rho_batch, orbphase_batch, wavelength, delta_x) -> (n_chords, n_wav)`.
+Key methods (called internally by `Transit`):
+
+| Method | Returns |
+|---|---|
+| `getLOSopticalDepth_Batch(x_grid, phi_batch, rho_batch, orbphase_batch, wavelength, delta_x)` | `tau` of shape `(n_chords, n_wav)`. The optimized pure-extinction kernel. |
+| `getLOSopticalDepthAndEmission_Batch(…, stellarIntensity, x_block=None, return_visible_tau=False)` | `(tau, I_em)`, both `(n_chords, n_wav)`. `I_em` is emergent emission in physical cgs specific intensity. With `return_visible_tau`, also returns the optical depth over the cells in front of `x_block` — what attenuates a surface below the gas. Requires `emission` to be set. |
 
 ---
 
@@ -327,7 +342,7 @@ The orchestrator. `atmosphere` is an `Atmosphere`, `wavelengthGrid` a `Wavelengt
 | Method | Purpose |
 |---|---|
 | `addWavelength()` | Build and store `Transit.wavelength` (cm) from the atomic line list and grid parameters. Call before `sumOverChords`. |
-| `sumOverChords(max_memory_gb=2.0) -> np.ndarray` | Run the simulation. Returns `R` of shape `(orbphase_steps, n_wavelength)`. `R[i]` is the flux ratio at orbital phase `i`; `1 - R[i]` is the transit depth. |
+| `sumOverChords(max_memory_gb=2.0, return_components=False)` | Run the simulation. Returns `R` of shape `(orbphase_steps, n_wavelength)`. `R[i]` is the flux ratio at orbital phase `i`; `1 - R[i]` is the transit depth. With an emission model, `R` may exceed 1; `return_components=True` returns `{'R', 'transmission', 'emission'}` instead. |
 | `evaluateChord(phi, rho, orbphase)` | Lower-level single-chord evaluation returning `(F_in, F_out)`. |
 | `checkBlock(phi, rho, orbphase)` | Whether a chord is blocked by the opaque planet/moon disk. |
 
@@ -349,13 +364,16 @@ A one-call wrapper around the `Atmosphere` → `Transit` → `sumOverChords` red
 ```python
 run_transit(scenarios, wavelengthGrid, spatialGrid,
             hasOrbitalDopplerShift=True, use_phoenix_star=True,
-            max_memory_gb=4.0) -> TransitResult
+            max_memory_gb=4.0, emission=None,
+            illumination_velocity=1.0e7) -> TransitResult
 ```
 
 - `scenarios` — list of density distributions (e.g. from the scenario builders); the host planet is taken from the first.
-- `use_phoenix_star=False` uses a flat star (much faster; fine for relative depths).
+- `use_phoenix_star=False` uses a flat star (much faster; fine for relative depths). With `emission`, a flat star falls back to a blackbody at `T_eff` for the absolute illumination — an explicit assumption, and featureless, so `stellar_doppler` has no effect.
+- `emission` — an `emission.EmissionModel`; `None` keeps the classic transit.
+- `illumination_velocity` — velocity margin [cm/s] by which the PHOENIX window is widened when emission is on, since the spectrum is then sampled in the parcel's frame. Default 100 km/s.
 
-`TransitResult` (a dataclass) carries `wavelength_cm`, `R_2D` (`(n_phase, n_wav)`), `orbphase`, `planet`, with:
+`TransitResult` (a dataclass) carries `wavelength_cm`, `R_2D` (`(n_phase, n_wav)`), `orbphase`, `planet`, `R_emission_2D` (the emission-only part, or `None`), with:
 
 | Member | Returns |
 |---|---|
@@ -364,6 +382,8 @@ run_transit(scenarios, wavelengthGrid, spatialGrid,
 | `spectrum_normalized()` | Spectrum / its continuum max. |
 | `transit_depth(line_window_ang=…, continuum_exclude_ang=…, mode='peak')` | Excess absorption fraction vs continuum (`mode='peak'` or `'mean'`). |
 | `lightcurve(line_window_ang=…, continuum_exclude_ang=…, mode='mean')` | Band line/continuum vs phase (needs `orbphase_steps>1`). |
+| `emission_spectrum()` | Phase-collapsed emission-only contribution to `R(λ)`, in units of the unobscured stellar flux. Emission runs only. |
+| `fill_in_fraction(line_window_ang=…)` | Fraction of the pure-extinction line absorption refilled by scattered photons. Emission runs only. |
 
 Window defaults are centred on the vacuum Na D2 line (`const.NA_D2_ANG`).
 
@@ -376,9 +396,124 @@ depth_pct = res.transit_depth() * 100.0
 
 ---
 
+## `emission`
+
+Emission physics. Import as `from Prometheus.core import emission as emis`. See
+[architecture.md](architecture.md#emission) for the radiative transfer and the
+stated approximations.
+
+### `EmissionModel`
+
+```python
+EmissionModel(resonant_scattering=True, thermal=False, molecular=False,
+              aerosol_scattering=False, aerosol_albedo=1.0,
+              stellar_doppler=True, self_shielding=False)
+```
+
+The switchboard; pass an instance to `Atmosphere(..., emission=...)` or
+`run_transit(..., emission=...)`.
+
+| Field | Effect |
+|---|---|
+| `resonant_scattering` | Single scattering of starlight by the atomic/ionic line opacity. The exomoon-cloud term. |
+| `thermal` | LTE thermal emission `j = n·sigma·B_λ(T)`; only density models carrying a temperature contribute. |
+| `molecular` | Let molecular constituents carry a source term too (they always carry extinction). Off by default — it forces the expensive per-cell molecular interpolation. |
+| `aerosol_scattering` | Isotropic single scattering by aerosol/haze opacity. Off by default; real aerosols are strongly forward-scattering. |
+| `aerosol_albedo` | Single-scattering albedo of the aerosol opacity, splitting its extinction into a scattering share (`albedo`, which redirects starlight) and a true-absorption share (`1 - albedo`, which emits thermally under `thermal`). The default 1.0 is a pure scatterer that neither absorbs nor emits; use 0.0 for a purely absorbing grey opacity. Line opacity is always pure absorption. A modelling **assumption**, not a measurement. |
+| `stellar_doppler` | Sample the stellar spectrum in the parcel's frame, so gas inside a stellar Fraunhofer core is illuminated weakly and Doppler-shifted gas is illuminated strongly. No effect for a flat/blackbody star. |
+| `self_shielding` | Reserved; raises `NotImplementedError` if set. |
+
+Constructing a model with no active source term raises `ValueError` — pass
+`emission=None` for a pure-extinction transit instead.
+
+### Primitives
+
+| Function | Returns |
+|---|---|
+| `planck_lambda(wavelength, T)` | `B_λ(T)` [erg s⁻¹ cm⁻² cm⁻¹ sr⁻¹]; `T` may be an array broadcastable against `wavelength`. |
+| `dilution_factor(r, R_star)` | `W = Omega_star/4π = 0.5·(1 − sqrt(1 − (R_star/r)²))`, in `[0, 0.5]`. |
+| `g_factor(constituent, star, r, wavelength=None, v_radial=0.0)` | Photon scattering rate per atom [photons s⁻¹], by integrating the constituent's own cross section against the diluted stellar photon flux. Diagnostic only — the transfer never needs it. `v_radial` is the parcel's velocity *away from* the star. |
+
+### `StellarIntensity`
+
+```python
+StellarIntensity(star, wavelength, disk_average=True)
+```
+
+The stellar surface intensity in physical cgs — PHOENIX if attached to the
+star, otherwise a blackbody at `T_eff` (an explicit assumption). Callable on any
+wavelength array whose last axis is monotonically non-decreasing.
+`.internal_scale` converts a physical cgs intensity into the units `Transit`
+accumulates `F_out` in; `.is_phoenix` says which branch is active.
+
+### Model hooks
+
+A density model may expose `calculateRadialVelocityFromStar(x_grid, phi_batch,
+rho_batch, orbphase_batch) -> (n_chords, n_x)`, the velocity component along the
+star→parcel direction (positive = receding). `RadialWindExosphere` implements
+it; models without it are treated as moving perpendicular to the star direction,
+which is exact for a circular orbit.
+
+---
+
+## `eclipse`
+
+Secondary-eclipse (dayside emission) geometry. Import as
+`from Prometheus.core import eclipse as ecl`. See
+[architecture.md](architecture.md#secondary-eclipses).
+
+### `DaysideSurface`
+
+```python
+DaysideSurface(T_day, profile='uniform', emissivity=1.0, T_floor=1.0)
+```
+
+The opaque lower boundary, seen at superior conjunction where the sub-observer
+point coincides with the substellar point.
+
+- `profile='uniform'` — the whole visible disk at `T_day`. This is precisely
+  what a measured brightness temperature means, so it is the mode to use when
+  comparing against one.
+- `profile='instant'` — instantaneous re-radiation, `T = T_day · cos(θ)**0.25`,
+  the no-redistribution limit, with `T_day` the substellar temperature.
+- `emissivity` — grey surface emissivity; scales the depth linearly. An
+  **assumption**, not a measurement.
+
+### `Eclipse`
+
+```python
+Eclipse(planet, wavelength, surface=None, atmosphere=None, R_top=None,
+        b_steps=60, phi_steps=1, x_border=None, x_steps=40)
+```
+
+At least one of `surface` and `atmosphere` must be given. `atmosphere` must be
+an `Atmosphere` carrying an `EmissionModel`. `R_top` defaults to the planet
+radius; raise it to include an extended atmosphere's limb.
+
+| Method | Returns |
+|---|---|
+| `depth()` | `F_planet / F_star` per wavelength, `(n_wav,)`. Multiply by 1e6 for ppm. |
+| `bandDepth(lower_cm, upper_cm, weights=None)` | Stellar-flux-weighted band average, which is what a broadband eclipse depth measures. |
+| `brightnessTemperature(depth=None)` | Temperature of a uniform blackbody disk giving that depth, per wavelength. |
+| `emergentIntensity()` | Per-ray emergent intensity, `(n_rays, n_wav)`. |
+| `rayGrid()` | `(b, theta, weights)`; `weights` are `b·db·dθ` and sum to the projected area. |
+
+### Module functions
+
+| Function | Returns |
+|---|---|
+| `inverse_planck(wavelength, B)` | Temperature whose Planck function equals `B`; NaN where `B <= 0`. |
+| `band_brightness_temperature(planet, wavelength, depth, lower_cm, upper_cm)` | The uniform dayside temperature whose band-averaged depth matches a measured one. Use it to turn a published eclipse depth into the temperature a model must reproduce. |
+
+The dayside temperature is an input, not a prediction: there is no
+energy-balance or heat-redistribution solver, and the ingress/egress light curve
+is not modelled.
+
+---
+
 ## `constants`
 
-Physical constants (cgs): `e`, `m_e`, `c`, `G`, `k_B`, `amu`, `R_J`, `M_J`, `M_E`, `R_sun`, `M_sun`, `R_Io`, `AU`. Na D doublet rest wavelengths (Å, **vacuum**, matching `LineList.txt`): `NA_D2_ANG` (5891.583), `NA_D1_ANG` (5897.558).
+Physical constants (cgs): `e`, `m_e`, `c`, `G`, `k_B`, `h`, `amu`, `R_J`, `M_J`, `M_E`, `R_sun`, `M_sun`, `R_Io`, `AU`. Na D doublet rest wavelengths (Å, **vacuum**, matching `LineList.txt`): `NA_D2_ANG` (5891.583), `NA_D1_ANG` (5897.558).
 
 - `calculateDopplerShift(v)` — relativistic Doppler factor for line-of-sight velocity `v` (cm/s).
 - `AvailableSpecies().findSpecies(name)` / `.listSpeciesNames()` — the atomic/ionic catalog. Built-in species include `NaI`, `KI`, `SiI`–`SiIV`, `MgI`/`MgII`, `AlI`, `CaI`/`CaII`, `TiI`/`TiII`, `CrI`, `MnI`, `FeI`, `CoI`, `NiI`, `OI`, `CII`, `SIII`, `SIV`.

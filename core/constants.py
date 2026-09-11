@@ -15,6 +15,7 @@ m_e = 9.109e-28
 c = 2.998e10
 G = 6.674*10**(-8)
 k_B = 1.381*10**(-16)
+h = 6.62607015e-27   # Planck constant [erg s] (exact, SI 2019 definition)
 amu = 1.661*10**(-24)
 R_J = 7.1492e9        # Jupiter equatorial radius
 M_J = 1.898e30      #Jupiter mass

@@ -21,6 +21,7 @@ from scipy.ndimage import gaussian_filter as gauss
 from scipy.special import erf, lambertw, voigt_profile
 
 from . import constants as const
+from . import emission as emis
 from . import geometryHandler as geom
 from . import memoryHandler as memutil
 
@@ -820,10 +821,13 @@ class SerpensExosphere(EvaporativeExosphere):
         planet (Any): The Planet object this exosphere belongs to.
         sigmaSmoothing (float): The sigma for Gaussian smoothing of the
             histogrammed density grid.
+        coRotating (bool): Whether the cloud co-orbits rigidly with the planet
+            (see :meth:`calculateNumberDensity`).
         InterpolatedDensity (Callable): A 3D interpolation function for number density.
     """
 
-    def __init__(self, filename: str, N: float, planet: Any, sigmaSmoothing: float):
+    def __init__(self, filename: str, N: float, planet: Any,
+                 sigmaSmoothing: float, coRotating: bool = True):
         """Initializes the SerpensExosphere.
 
         Args:
@@ -831,21 +835,44 @@ class SerpensExosphere(EvaporativeExosphere):
             N (float): Total number of particles to scale the simulation to.
             planet (Any): The Planet object this exosphere belongs to.
             sigmaSmoothing (float): The sigma for Gaussian smoothing in grid units.
+            coRotating (bool): Treat the cloud as co-orbiting rigidly with the
+                planet, i.e. frozen in the frame that rotates with it, so that
+                it follows the planet across the stellar disk as the orbital
+                phase advances.  This is what makes a lightcurve meaningful.
+                ``False`` pins the cloud to the stellar rest frame (the old
+                behaviour), which is only equivalent at mid-transit.
         """
         super().__init__(N)
         self.filename: str = filename
         self.planet: Any = planet
         self.sigmaSmoothing: float = sigmaSmoothing
+        self.coRotating: bool = bool(coRotating)
 
     def addInterpolatedDensity(self, spatialGrid: Any) -> None:
         """Loads SERPENS data and creates the density interpolation function.
+
+        The input file holds one row per SERPENS superparticle.  Three columns
+        (x, y, z in metres) are histogrammed with equal weight.  An optional
+        fourth column carries a per-superparticle weight -- SERPENS is a
+        *weighted* test-particle code, and its analyzer assigns each
+        superparticle a physical weight (e.g. the exp(-dt/tau) survival factor,
+        or a grain-size-bin weight for dust).  When present, the weights are
+        used in the histogram and the normalisation divides by their sum rather
+        than by the particle count, so ``self.N`` remains the total physical
+        particle number either way.
 
         Args:
             spatialGrid (Any): The `geometryHandler.Grid` object defining the
                 simulation grid.
         """
-        serpensOutput = np.loadtxt(self.filename) * 1e2
-        particlePos = serpensOutput[:, 0:3]
+        serpensOutput = np.atleast_2d(np.loadtxt(self.filename))
+        particlePos = serpensOutput[:, 0:3] * 1e2   # m -> cm
+        if serpensOutput.shape[1] > 3:
+            particleWeights = serpensOutput[:, 3]
+            weightSum = np.sum(particleWeights)
+        else:
+            particleWeights = None
+            weightSum = float(np.size(particlePos, axis=0))
         xBins = spatialGrid.constructXaxis(midpoints=False)
         yBins = np.linspace(-spatialGrid.rho_border,
                             spatialGrid.rho_border, 2 * int(spatialGrid.rho_steps) + 1)
@@ -853,8 +880,9 @@ class SerpensExosphere(EvaporativeExosphere):
                             spatialGrid.rho_border, 2 * int(spatialGrid.rho_steps) + 1)
         cellVolume = (xBins[1] - xBins[0]) * \
             (yBins[1] - yBins[0]) * (zBins[1] - zBins[0])
-        n_histogram = np.histogramdd(particlePos, bins=[xBins, yBins, zBins])[
-            0] * self.N / (np.size(particlePos, axis=0) * cellVolume)
+        n_histogram = np.histogramdd(particlePos, bins=[xBins, yBins, zBins],
+                                     weights=particleWeights)[
+            0] * self.N / (weightSum * cellVolume)
         if self.sigmaSmoothing > 0.:
             n_histogram = gauss(n_histogram, sigma=self.sigmaSmoothing)
         print('Sum over all particles, potentially smoothed with a Gaussian:', np.sum(
@@ -888,8 +916,11 @@ class SerpensExosphere(EvaporativeExosphere):
             phi (float | np.ndarray): Azimuthal sky-plane angle(s) (radians).
             rho (float | np.ndarray): Projected radial distance(s) from the star
                 centre (cm).
-            orbphase (float): Planet's orbital phase (radians); unused here as the
-                SERPENS density field is static in the transit frame.
+            orbphase (float | np.ndarray): Planet's orbital phase (radians),
+                scalar or ``(n_chords,)``.  With ``coRotating`` the query point
+                is rotated back into the frame in which the cloud was tabulated
+                (the planet at ``(a, 0, 0)``), so the cloud sweeps across the
+                stellar disk with the planet; otherwise it is ignored.
 
         Returns:
             np.ndarray: Number density (cm^-3).  Shape ``(n_x,)`` for scalar
@@ -904,6 +935,19 @@ class SerpensExosphere(EvaporativeExosphere):
         X = np.broadcast_to(x[None, :], (n_chords, n_x))
         Y = np.broadcast_to(np.atleast_1d(y)[:, None], (n_chords, n_x))
         Z = np.broadcast_to(np.atleast_1d(z)[:, None], (n_chords, n_x))
+        if self.coRotating:
+            # The tabulated field is defined with the planet on the +x axis
+            # (orbphase 0).  The planet at phase f sits at (a cos f, a sin f, 0)
+            # (celestialBodies.Planet.getPosition), so a star-frame point maps to
+            # the tabulated frame by the inverse rotation R_z(-f).
+            f = np.atleast_1d(np.asarray(orbphase, dtype=float))
+            if f.size not in (1, n_chords):
+                raise ValueError(
+                    f'orbphase has {f.size} entries, expected 1 or {n_chords}.')
+            cos_f, sin_f = np.cos(f)[:, None], np.sin(f)[:, None]
+            X, Y = X * cos_f + Y * sin_f, -X * sin_f + Y * cos_f
+            X = np.broadcast_to(X, (n_chords, n_x))
+            Y = np.broadcast_to(Y, (n_chords, n_x))
         coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
         n = self.InterpolatedDensity(coords).reshape(n_chords, n_x)
         return n[0] if scalar_in else n
@@ -1141,6 +1185,47 @@ class RadialWindExosphere(EvaporativeExosphere):
         # matching the sign convention of planet.getLOSvelocity.
         return v_radial * dx / r_safe
 
+    def calculateRadialVelocityFromStar(self, x_grid: np.ndarray, phi_batch: np.ndarray,
+                                        rho_batch: np.ndarray,
+                                        orbphase_batch: np.ndarray) -> np.ndarray:
+        """Velocity component along the star-to-parcel direction (n_chords, n_x) [cm/s].
+
+        Positive means the parcel is **receding from the star**, so it sees the
+        stellar spectrum redshifted and therefore samples it at a bluer rest
+        wavelength.  This is the quantity that decides whether a scattering atom
+        sits inside a stellar Fraunhofer core (weak illumination, small
+        g-factor) or has Doppler-shifted out of it (strong illumination).
+
+        For a radial outflow the velocity vector is ``v(r_p) * r_hat_p``, so its
+        projection on the stellar radial direction ``s_hat`` is
+        ``v(r_p) * (r_hat_p . s_hat)``.  The planet's own orbital motion is not
+        included: on a circular orbit it is perpendicular to ``s_hat``.
+
+        Args:
+            x_grid (np.ndarray): LOS positions (n_x,) [cm].
+            phi_batch (np.ndarray): Azimuthal angles (n_chords,) [rad].
+            rho_batch (np.ndarray): Projected radii (n_chords,) [cm].
+            orbphase_batch (np.ndarray): Orbital phases (n_chords,) [rad].
+
+        Returns:
+            np.ndarray: Radial velocity away from the star (n_chords, n_x) [cm/s].
+        """
+        y, z = geom.Grid.getCartesianFromCylinder(phi_batch, rho_batch)
+        x_p, y_p = self.planet.getPosition(orbphase_batch)
+
+        x_ = x_grid[np.newaxis, :]                      # (1, n_x)
+        dx = x_ - np.asarray(x_p)[:, np.newaxis]        # (n_chords, n_x)
+        dy = (np.asarray(y) - np.asarray(y_p))[:, np.newaxis]
+        dz = np.asarray(z)[:, np.newaxis]
+
+        r_p = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)      # parcel <- planet
+        r_s = np.sqrt(x_ ** 2 + (np.asarray(y)[:, np.newaxis]) ** 2 + dz ** 2)
+
+        v_radial = self._wind_velocity(r_p)
+        dot = (dx * x_ + dy * np.asarray(y)[:, np.newaxis] + dz ** 2)
+        denom = np.maximum(r_p * r_s, 1.0)
+        return v_radial * dot / denom
+
 
 """
 Calculate absorption cross sections
@@ -1323,7 +1408,24 @@ class MolecularConstituent:
         _DOPPLER_MARGIN = 0.01  # 1 % covers ~3000 km/s, well beyond any orbital speed
 
         with h5py.File(molecularLookupPath + self.moleculeName + '.h5', 'r+') as f:
-            P = f['p'][:] * 10.
+            # Pressure -> cgs (dyn/cm^2, = erg/cm^3), the unit the rest of
+            # Prometheus works in, since it compares against n * k_B * T with
+            # n in cm^-3.  ExoMolOP/TauREx tables carry an explicit 'units'
+            # attribute; honour it rather than assuming, because getting this
+            # wrong shifts the whole table along the pressure axis and the
+            # result still looks like a perfectly smooth spectrum.
+            _P_TO_CGS = {'bar': 1.0e6, 'pa': 10.0, 'pascal': 10.0,
+                         'dyn/cm^2': 1.0, 'barye': 1.0}
+            _unit = f['p'].attrs.get('units', 'bar')
+            if isinstance(_unit, bytes):
+                _unit = _unit.decode()
+            _unit = str(_unit).strip().lower()
+            if _unit not in _P_TO_CGS:
+                raise ValueError(
+                    f"{self.moleculeName}.h5 declares pressure units "
+                    f"{_unit!r}, which is not one of {sorted(_P_TO_CGS)}. "
+                    "Refusing to guess.")
+            P = f['p'][:] * _P_TO_CGS[_unit]
             T = f['t'][:]
             wav_full = 1. / f['bin_edges'][:][::-1]
 
@@ -1918,15 +2020,21 @@ class Atmosphere:
             Doppler shifts from orbital motion.
     """
 
-    def __init__(self, densityDistributionList: List[Any], hasOrbitalDopplerShift: bool):
+    def __init__(self, densityDistributionList: List[Any], hasOrbitalDopplerShift: bool,
+                 emission: Optional['emis.EmissionModel'] = None):
         """Initializes the Atmosphere object.
 
         Args:
             densityDistributionList (List[Any]): A list of density model objects.
             hasOrbitalDopplerShift (bool): Flag for including orbital Doppler shifts.
+            emission (Optional[EmissionModel]): If given, the transit is solved
+                with a source term (resonance scattering and/or thermal
+                emission) instead of pure Beer-Lambert extinction.  ``None``
+                (the default) reproduces the pure-extinction behaviour exactly.
         """
         self.densityDistributionList: List[Any] = densityDistributionList
         self.hasOrbitalDopplerShift: bool = hasOrbitalDopplerShift
+        self.emission: Optional['emis.EmissionModel'] = emission
 
     @staticmethod
     def getAbsorberNumberDensity(densityDistribution: Any, chi: float, x: np.ndarray, phi: float, rho: float, orbphase: float) -> np.ndarray:
@@ -2114,6 +2222,321 @@ class Atmosphere:
 
         return total_tau
 
+    # ------------------------------------------------------------------
+    # Emission-capable kernel
+    # ------------------------------------------------------------------
+
+    def _prepareBatch(self, dist_model, x_grid, phi_batch, rho_batch,
+                      orbphase_batch, wavelength):
+        """Per-model, per-batch quantities that do not depend on the LOS cell.
+
+        Factored out of :meth:`getLOSopticalDepthAndEmission_Batch` so the
+        cell loop stays readable.  Returns a dict holding the Doppler-shifted
+        wavelength grids, the density field, the temperature field, the
+        stellar-frame Doppler factors and the per-constituent absorber columns.
+
+        Args:
+            dist_model (Any): One density distribution.
+            x_grid (np.ndarray): LOS grid (n_x,) [cm].
+            phi_batch, rho_batch, orbphase_batch (np.ndarray): Chord coordinates.
+            wavelength (np.ndarray): Observer-frame wavelength grid (n_wav,) [cm].
+
+        Returns:
+            dict: The prepared fields.
+        """
+        n_chords = len(phi_batch)
+
+        if self.hasOrbitalDopplerShift:
+            body = dist_model.moon if dist_model.hasMoon else dist_model.planet
+            v_bulk = body.getLOSvelocity(orbphase_batch)
+        else:
+            v_bulk = np.zeros(n_chords)
+
+        shifts = const.calculateDopplerShift(-v_bulk)
+        shifted_wav = np.ascontiguousarray(
+            shifts[:, np.newaxis] * wavelength[np.newaxis, :])
+
+        if hasattr(dist_model, 'calculateLOSVelocity') and self.hasOrbitalDopplerShift:
+            v_wind = dist_model.calculateLOSVelocity(
+                x_grid, phi_batch, rho_batch, orbphase_batch)
+            shifts_field = const.calculateDopplerShift(
+                -(v_wind + v_bulk[:, np.newaxis]))
+        else:
+            shifts_field = None
+
+        n_tot = dist_model.calculateNumberDensity(
+            x_grid, phi_batch, rho_batch, orbphase_batch)
+
+        nonisothermal = getattr(dist_model, 'isNonIsothermal', False)
+        T_field = (dist_model.calculateTemperature(
+            x_grid, phi_batch, rho_batch, orbphase_batch) if nonisothermal else None)
+        T_iso = getattr(dist_model, 'T', None)
+
+        # Doppler factor between the parcel frame and the stellar rest frame.
+        # Only radial (star -> parcel) motion shifts which part of the stellar
+        # spectrum the parcel is illuminated by.
+        star_shift = None
+        if (self.emission is not None and self.emission.stellar_doppler
+                and hasattr(dist_model, 'calculateRadialVelocityFromStar')):
+            v_ra = dist_model.calculateRadialVelocityFromStar(
+                x_grid, phi_batch, rho_batch, orbphase_batch)
+            star_shift = const.calculateDopplerShift(v_ra)
+
+        # Per-constituent absorber columns n_abs(chord, x), with the aerosol
+        # scale-height and cloud-top rules applied once here rather than per cell.
+        columns = []
+        for constituent in dist_model.constituents:
+            if getattr(constituent, 'isScatterer', False):
+                n_abs = n_tot * constituent.chi
+                fH = getattr(constituent, 'scale_height_factor', 1.0)
+                if fH != 1.0 and hasattr(dist_model, 'getReferenceNumberDensity'):
+                    n_ref = dist_model.getReferenceNumberDensity()
+                    ratio = np.where(n_tot > 0.0, n_tot / n_ref, 0.0)
+                    n_abs = np.where(n_tot > 0.0,
+                                     constituent.chi * n_ref * ratio ** (1.0 / fH),
+                                     0.0)
+                if constituent.P_top is not None and T_iso is not None:
+                    P = n_tot * const.k_B * T_iso
+                    n_abs = np.where(P >= constituent.P_top, n_abs, 0.0)
+            else:
+                n_abs = n_tot * constituent.chi
+            columns.append((constituent, n_abs))
+
+        return {
+            'shifted_wav': shifted_wav,
+            'shifts_field': shifts_field,
+            'n_tot': n_tot,
+            'T_field': T_field,
+            'T_iso': T_iso,
+            'star_shift': star_shift,
+            'columns': columns,
+        }
+
+    def getLOSopticalDepthAndEmission_Batch(self, x_grid, phi_batch, rho_batch,
+                                            orbphase_batch, wavelength, delta_x,
+                                            stellarIntensity, x_block=None,
+                                            return_visible_tau=False):
+        """Optical depth **and** emergent emission for a batch of chords.
+
+        Solves the formal radiative-transfer equation along each chord instead
+        of applying Beer-Lambert alone.  With the observer at ``x = -inf`` and
+        cells ordered by increasing ``x``,
+
+            I = I_star * exp(-tau_total) + sum_i j_i * dx * exp(-tau_i->obs),
+
+        and this method returns ``tau_total`` and the sum, i.e. everything
+        except the stellar term (which ``Transit`` owns, because it carries the
+        limb darkening and the stellar rotation).
+
+        Unlike :meth:`getLOSopticalDepth_Batch`, the loop over cells is the
+        *outer* loop.  It has to be: the attenuation of a cell's emission
+        depends on the total optical depth accumulated between that cell and
+        the observer, summed over every species, so the per-cell contributions
+        of all constituents must be available at the same time.  Everything
+        stays vectorised over chords and wavelength, so the peak allocation is
+        ``(n_chords, n_wav)`` as before -- never the ``(chord, x, wavelength)``
+        tensor.
+
+        Each cell's emission is integrated exactly for a constant source
+        function across the cell, ``S * (1 - exp(-dtau))``, rather than with a
+        midpoint weight.  The two agree while cells are thin, but only the
+        exact form stays right once a cell becomes optically thick -- which is
+        what makes an opaque layer in LTE correctly re-emit everything it
+        absorbs (Kirchhoff's law).
+
+        Args:
+            x_grid (np.ndarray): LOS grid (n_x,) [cm].
+            phi_batch (np.ndarray): Azimuthal angles (n_chords,) [rad].
+            rho_batch (np.ndarray): Projected radii (n_chords,) [cm].
+            orbphase_batch (np.ndarray): Orbital phases (n_chords,) [rad].
+            wavelength (np.ndarray): Observer-frame wavelengths (n_wav,) [cm].
+            delta_x (float): LOS cell thickness [cm].
+            stellarIntensity (emission.StellarIntensity): Physical-cgs stellar
+                surface intensity, used as the illumination for scattering.
+            x_block (Optional[np.ndarray]): For each chord, the ``x`` coordinate
+                of the nearest opaque body along it, or ``+inf`` if the chord is
+                unobstructed.  Gas behind that body is hidden from the observer
+                and is excluded from the emission integral.
+            return_visible_tau (bool): Also return the optical depth accumulated
+                over the *visible* cells only, i.e. between the occulting body
+                and the observer.  That is what attenuates radiation emitted by
+                the body's surface, so an eclipse calculation needs it.  Equal
+                to ``tau`` wherever the chord is unobstructed.
+
+        Returns:
+            Tuple[np.ndarray, ...]:
+                - ``tau`` (n_chords, n_wav): total optical depth.
+                - ``I_em`` (n_chords, n_wav): emergent emission in physical cgs
+                  specific intensity [erg s^-1 cm^-2 cm^-1 sr^-1].
+                - ``tau_visible`` (n_chords, n_wav), only when
+                  ``return_visible_tau`` is set.
+        """
+        em = self.emission
+        if em is None:
+            raise ValueError(
+                "getLOSopticalDepthAndEmission_Batch requires an EmissionModel; "
+                "construct the Atmosphere with emission=EmissionModel(...).")
+
+        n_chords = len(phi_batch)
+        n_wav = len(wavelength)
+        n_x = len(x_grid)
+        star = self.densityDistributionList[0].planet.hostStar
+
+        # Distance of every cell from the stellar centre, and hence the solid
+        # angle the star subtends there.
+        r_star = np.sqrt(x_grid[np.newaxis, :] ** 2
+                         + (np.asarray(rho_batch) ** 2)[:, np.newaxis])
+        W_dil = emis.dilution_factor(r_star, star.R)
+
+        if x_block is None:
+            visible = None
+        else:
+            visible = (x_grid[np.newaxis, :] < np.asarray(x_block)[:, np.newaxis])
+
+        prepared = [
+            self._prepareBatch(m, x_grid, phi_batch, rho_batch,
+                               orbphase_batch, wavelength)
+            for m in self.densityDistributionList
+        ]
+
+        # Isothermal models: the Planck source is cell-independent, so hoist it.
+        for P in prepared:
+            P['B_iso'] = (emis.planck_lambda(P['shifted_wav'], P['T_iso'])
+                          if (em.thermal and P['T_iso'] is not None
+                              and P['T_field'] is None) else None)
+
+        tau = np.zeros((n_chords, n_wav))
+        tau_visible = np.zeros((n_chords, n_wav)) if return_visible_tau else None
+        I_em = np.zeros((n_chords, n_wav))
+
+        for xi in range(n_x):
+            dtau = np.zeros((n_chords, n_wav))
+            j_nu = np.zeros((n_chords, n_wav))
+
+            for P in prepared:
+                shifted_wav = P['shifted_wav']
+                shifts_field = P['shifts_field']
+
+                # Wavelength in the parcel's own frame for this cell.
+                if shifts_field is None:
+                    lam_gas = shifted_wav
+                else:
+                    lam_gas = np.ascontiguousarray(
+                        shifts_field[:, xi, np.newaxis] * wavelength[np.newaxis, :])
+
+                # The stellar spectrum as sampled by this parcel.  Cached per
+                # cell because every constituent of this model shares it.
+                illum = None
+
+                def _illumination():
+                    """Diluted stellar intensity seen by this cell (n_chords, n_wav)."""
+                    if P['star_shift'] is None:
+                        lam_star = lam_gas
+                    else:
+                        lam_star = np.ascontiguousarray(
+                            lam_gas * P['star_shift'][:, xi, np.newaxis])
+                    return W_dil[:, xi, np.newaxis] * stellarIntensity(lam_star)
+
+                if P['T_field'] is not None:
+                    B_cell = emis.planck_lambda(lam_gas,
+                                                P['T_field'][:, xi, np.newaxis])
+                else:
+                    B_cell = P['B_iso']
+
+                for constituent, n_abs in P['columns']:
+                    col = n_abs[:, xi, np.newaxis]
+
+                    if constituent.isMolecule:
+                        if P['T_field'] is not None:
+                            T_cell = P['T_field'][:, xi]
+                            P_cell = np.clip(
+                                P['n_tot'][:, xi] * const.k_B * T_cell, 1e-4, None)
+                            sigma_native = _bilinear_PT_interp_Tvec(
+                                P_cell, T_cell, constituent.P_grid,
+                                constituent.T_grid, constituent.sigma_grid_log,
+                                constituent.lookupOffset)
+                        else:
+                            T_cell = P['T_iso']
+                            P_cell = np.clip(
+                                P['n_tot'][:, xi] * const.k_B * T_cell, 1e-4, None)
+                            sigma_native = _bilinear_PT_interp(
+                                P_cell, T_cell, constituent.P_grid,
+                                constituent.T_grid, constituent.sigma_grid_log,
+                                constituent.lookupOffset)
+                        sigma = n_interp_linear_rows(
+                            lam_gas, constituent.wav_grid, sigma_native)
+                        emits = em.molecular
+                        scatters = em.molecular and em.resonant_scattering
+
+                    elif getattr(constituent, 'isScatterer', False):
+                        sigma = np.broadcast_to(
+                            constituent.getSigmaAbs(wavelength)[np.newaxis, :],
+                            (n_chords, n_wav))
+                        # Thermal emission from the absorbed share of aerosol
+                        # extinction is required by Kirchhoff whenever the
+                        # albedo is below 1, independent of whether the
+                        # scattering term is switched on.
+                        emits = em.aerosol_scattering or (
+                            em.thermal and em.aerosol_albedo < 1.0)
+                        scatters = em.aerosol_scattering
+
+                    else:  # atoms / ions
+                        sigma = constituent.getSigmaAbs(lam_gas)
+                        emits = em.needs_atoms
+                        scatters = em.resonant_scattering
+
+                    dtau += col * sigma * delta_x
+
+                    if not emits:
+                        continue
+
+                    # Extinction splits into scattering and true absorption.
+                    # Line opacity is taken as pure absorption (albedo 0), so
+                    # it both scatters resonantly and emits thermally in LTE.
+                    # Aerosol opacity splits by the single-scattering albedo:
+                    # the scattered share redirects starlight, the absorbed
+                    # share emits thermally.  Kirchhoff's law then holds for
+                    # every constituent.
+                    is_aerosol = getattr(constituent, 'isScatterer', False)
+                    albedo = em.aerosol_albedo if is_aerosol else 1.0
+                    source = np.zeros((n_chords, n_wav))
+                    if scatters:
+                        if illum is None:
+                            illum = _illumination()
+                        source = source + albedo * illum
+                    if em.thermal and B_cell is not None:
+                        absorbed_share = (1.0 - albedo) if is_aerosol else 1.0
+                        if absorbed_share > 0.0:
+                            source = source + absorbed_share * B_cell
+                    j_nu += col * sigma * source
+
+            if j_nu.any():
+                # Exact integral of a piecewise-constant source through the
+                # cell:  S * (1 - exp(-dtau)) * exp(-tau_to_observer), with
+                # S = j * delta_x / dtau the cell's source function.  Written
+                # as j*delta_x*w so that the optically thin limit (w -> 1) is
+                # recovered without dividing by zero.  The cruder midpoint
+                # weight exp(-(tau + dtau/2)) agrees with this to first order
+                # but collapses once a single cell becomes optically thick,
+                # which breaks Kirchhoff's law for an opaque layer.
+                thick = dtau > 1e-8
+                w = np.where(thick,
+                             -np.expm1(-np.where(thick, dtau, 1.0))
+                             / np.where(thick, dtau, 1.0),
+                             1.0 - 0.5 * dtau)
+                contribution = j_nu * delta_x * w * np.exp(-tau)
+                if visible is not None:
+                    contribution *= visible[:, xi][:, np.newaxis]
+                I_em += contribution
+            tau += dtau
+            if tau_visible is not None:
+                tau_visible += (dtau if visible is None
+                                else dtau * visible[:, xi][:, np.newaxis])
+
+        if return_visible_tau:
+            return tau, I_em, tau_visible
+        return tau, I_em
+
 
 class WavelengthGrid:
     """Creates and manages the wavelength grid for the simulation.
@@ -2299,6 +2722,11 @@ class Transit:
             rho (float): Projected radial distance from star's center (cm).
             orbphase (float): The planet's orbital phase (radians).
 
+        Note:
+            This lower-level helper is extinction-only and ignores any
+            :class:`emission.EmissionModel` attached to the atmosphere.  Use
+            :meth:`sumOverChords` for an emission-aware calculation.
+
         Returns:
             Tuple[np.ndarray, np.ndarray]: A tuple containing:
                 - F_in (np.ndarray): The attenuated flux received by the observer.
@@ -2325,7 +2753,30 @@ class Transit:
         F_in = rho * Fstar * np.exp(-tau)
         return F_in, F_out
 
-    def sumOverChords(self, max_memory_gb: float = 2.0) -> np.ndarray:
+    def sumOverChords(self, max_memory_gb: float = 2.0,
+                      return_components: bool = False):
+        """Integrates every chord and returns the normalised flux ``R(phase, lambda)``.
+
+        Without an emission model this is the classic transmission ratio
+        ``R = sum(F_in) / sum(F_out)``, bounded by 1.  With an
+        :class:`emission.EmissionModel` attached to the
+        :class:`Atmosphere`, each chord also carries the emission integrated
+        along it, so ``R`` can exceed 1 wherever the gas puts back more light
+        than it removes (an off-limb cloud, or a resonance line that is
+        scattering more than it is absorbing at that phase).
+
+        Args:
+            max_memory_gb (float): RAM budget for the chord batching.
+            return_components (bool): If True, return a dict with the combined
+                ``'R'`` plus its ``'transmission'`` and ``'emission'`` parts,
+                so the fill-in can be inspected separately.  The emission part
+                is the emission-only contribution normalised by the same
+                stellar denominator, i.e. ``R = transmission + emission``.
+
+        Returns:
+            np.ndarray or dict: ``R`` of shape ``(orbphase_steps, n_wav)``, or
+            the component dict when ``return_components`` is True.
+        """
         chordGrid = self.spatialGrid.getChordGrid()
         n_wav = len(self.wavelength)
         n_orb = self.spatialGrid.orbphase_steps
@@ -2353,6 +2804,18 @@ class Transit:
         
         v_star = star.vsiniStarrot * rho / star.R * np.cos(phi - star.phiStarrot)
         star_shifts = const.calculateDopplerShift(v_star)
+
+        # A chord outside the stellar limb receives no photospheric light.  With
+        # the default rho_border = R_star every chord is on-disk and this is a
+        # no-op; it matters once the sky-plane grid is widened past the limb to
+        # capture off-limb emission.
+        on_disk = (rho < star.R)
+
+        emission = self.atmosphere.emission
+        if emission is not None:
+            stellarIntensity = emis.StellarIntensity(star, self.wavelength)
+            emission_scale = stellarIntensity.internal_scale
+            F_em_sum = np.zeros((n_orb, n_wav))
         
         has_molecules = any(
             any(c.isMolecule for c in dist.constituents)
@@ -2399,42 +2862,64 @@ class Transit:
                                                   self.wavelength)
             else:
                 F_star_batch *= clv[idx, None]
+            F_star_batch = F_star_batch * on_disk[idx, None]
 
+            # Opaque bodies: which chords are blocked, and at what x the block
+            # sits (gas in front of it is still visible in emission).
+            x_p = self.planet.a * np.cos(orb[idx])
             y_p = self.planet.a * np.sin(orb[idx])
             is_blocked = (np.sqrt((y[idx] - y_p)**2 + z[idx]**2) < self.planet.R)
+            x_block = np.where(is_blocked, x_p, np.inf)
             for densityDistribution in self.atmosphere.densityDistributionList:
                 if densityDistribution.hasMoon:
                     moon = densityDistribution.moon
-                    y_moon = moon.getPosition(orb[idx])[1]
-                    is_blocked |= ((y[idx] - y_moon)**2 + z[idx]**2 < moon.R**2)
-            
+                    x_moon, y_moon = moon.getPosition(orb[idx])
+                    blocked_moon = ((y[idx] - y_moon)**2 + z[idx]**2 < moon.R**2)
+                    is_blocked |= blocked_moon
+                    x_block = np.minimum(
+                        x_block, np.where(blocked_moon, x_moon, np.inf))
+
             F_out = rho[idx, None] * F_star_batch
             F_in = np.zeros_like(F_out)
-            
-            active = ~is_blocked
-            if np.any(active):
-                tau = self.atmosphere.getLOSopticalDepth_Batch(
-                    x_grid, phi[idx][active], rho[idx][active], 
-                    orb[idx][active], self.wavelength, delta_x
-                )
-                F_in[active] = F_out[active] * np.exp(-tau)
 
+            active = ~is_blocked
+            if emission is None:
+                if np.any(active):
+                    tau = self.atmosphere.getLOSopticalDepth_Batch(
+                        x_grid, phi[idx][active], rho[idx][active],
+                        orb[idx][active], self.wavelength, delta_x
+                    )
+                    F_in[active] = F_out[active] * np.exp(-tau)
+                F_em = None
+            else:
+                # Every chord is integrated, blocked ones included: they still
+                # show the gas in front of the occulting body.
+                tau, I_em = self.atmosphere.getLOSopticalDepthAndEmission_Batch(
+                    x_grid, phi[idx], rho[idx], orb[idx], self.wavelength,
+                    delta_x, stellarIntensity, x_block=x_block
+                )
+                F_in[active] = F_out[active] * np.exp(-tau[active])
+                F_em = rho[idx, None] * I_em * emission_scale[None, :]
+                F_in = F_in + F_em
+
+            n_sky = self.spatialGrid.phi_steps * self.spatialGrid.rho_steps
             if batch_size == len(chordGrid):
-                F_in_sum = F_in.reshape(
-                    self.spatialGrid.phi_steps * self.spatialGrid.rho_steps,
-                    n_orb,
-                    n_wav,
-                ).sum(axis=0)
-                F_out_sum = F_out.reshape(
-                    self.spatialGrid.phi_steps * self.spatialGrid.rho_steps,
-                    n_orb,
-                    n_wav,
-                ).sum(axis=0)
+                F_in_sum = F_in.reshape(n_sky, n_orb, n_wav).sum(axis=0)
+                F_out_sum = F_out.reshape(n_sky, n_orb, n_wav).sum(axis=0)
+                if F_em is not None:
+                    F_em_sum = F_em.reshape(n_sky, n_orb, n_wav).sum(axis=0)
             else:
                 np.add.at(F_in_sum, orb_indices[idx], F_in)
                 np.add.at(F_out_sum, orb_indices[idx], F_out)
+                if F_em is not None:
+                    np.add.at(F_em_sum, orb_indices[idx], F_em)
 
-        return F_in_sum / F_out_sum
+        R = F_in_sum / F_out_sum
+        if not return_components:
+            return R
+        R_em = (F_em_sum / F_out_sum) if emission is not None \
+            else np.zeros_like(R)
+        return {'R': R, 'transmission': R - R_em, 'emission': R_em}
 
 
 """
@@ -2582,15 +3067,19 @@ class TransitResult:
     Attributes:
         wavelength_cm (np.ndarray): Wavelength grid [cm], shape ``(n_wav,)``.
         R_2D (np.ndarray): Transit-depth cube ``R(phase, lambda)``, shape
-            ``(n_phase, n_wav)``.
+            ``(n_phase, n_wav)``.  Values above 1 are physical once an
+            :class:`emission.EmissionModel` is in play.
         orbphase (np.ndarray): Orbital-phase axis [rad], shape ``(n_phase,)``.
         planet (Any): The :class:`celestialBodies.Planet` used.
+        R_emission_2D (Optional[np.ndarray]): The emission-only contribution to
+            ``R_2D``, same shape, or ``None`` for a pure-extinction run.
     """
 
     wavelength_cm: np.ndarray
     R_2D: np.ndarray
     orbphase: np.ndarray
     planet: Any
+    R_emission_2D: Optional[np.ndarray] = None
 
     #  axis conversions
     @property
@@ -2612,6 +3101,51 @@ class TransitResult:
         """Transmission spectrum normalised to its continuum (max -> 1)."""
         spec = self.spectrum()
         return spec / spec.max()
+
+    #  emission
+    def emission_spectrum(self) -> np.ndarray:
+        """Phase-collapsed emission-only contribution to ``R(lambda)``.
+
+        This is the excess flux the gas *adds* to the system, in units of the
+        unobscured stellar flux: 1e-3 means the line emits a tenth of a percent
+        of the star.  Requires a run with an ``EmissionModel``.
+
+        Returns:
+            np.ndarray: Emission contribution, shape ``(n_wav,)``.
+        """
+        if self.R_emission_2D is None:
+            raise ValueError(
+                "This transit was run without an EmissionModel; pass "
+                "emission=EmissionModel(...) to run_transit to get it.")
+        return np.median(self.R_emission_2D, axis=0)
+
+    def fill_in_fraction(self,
+                         line_window_ang=(const.NA_D2_ANG - 4.0,
+                                          const.NA_D2_ANG + 4.0)) -> float:
+        """Fraction of the pure-extinction line absorption refilled by emission.
+
+        The single number that says how much a resonance-scattering treatment
+        changes the answer: 0 means emission is negligible and the classic
+        Beer-Lambert depth stands; 0.3 means scattered photons have refilled
+        30% of the absorption and the moon-cloud mass inferred from a
+        pure-absorption fit was underestimated by that much.
+
+        Args:
+            line_window_ang: ``(lo, hi)`` line bandpass [Angstrom].
+
+        Returns:
+            float: The refilled fraction of the band-integrated absorption.
+        """
+        if self.R_emission_2D is None:
+            raise ValueError(
+                "This transit was run without an EmissionModel.")
+        line_mask, _ = self._masks(line_window_ang, None)
+        R = self.spectrum()[line_mask]
+        R_em = self.emission_spectrum()[line_mask]
+        absorbed = np.sum(1.0 - (R - R_em))
+        if absorbed <= 0.0:
+            return 0.0
+        return float(np.sum(R_em) / absorbed)
 
     #  derived line metrics
     def _masks(self, line_window_ang, continuum_exclude_ang):
@@ -2684,7 +3218,9 @@ class TransitResult:
 def run_transit(scenarios: List[Any], wavelengthGrid: 'WavelengthGrid',
                 spatialGrid: geom.Grid, hasOrbitalDopplerShift: bool = True,
                 use_phoenix_star: bool = True,
-                max_memory_gb: float = 4.0) -> TransitResult:
+                max_memory_gb: float = 4.0,
+                emission: Optional['emis.EmissionModel'] = None,
+                illumination_velocity: float = 1.0e7) -> TransitResult:
     """Runs a full transit from a list of density distributions.
 
     Builds the :class:`Atmosphere` / :class:`Transit`, constructs the wavelength
@@ -2702,18 +3238,34 @@ def run_transit(scenarios: List[Any], wavelengthGrid: 'WavelengthGrid',
             (``addFstarFunction``).  ``False`` uses a flat star (much faster;
             fine for relative depths).
         max_memory_gb (float): Memory cap passed to ``Transit.sumOverChords``.
+        emission (Optional[EmissionModel]): Solve with a source term (resonance
+            scattering / thermal emission) instead of pure extinction.  See
+            :mod:`emission`.  ``None`` keeps the classic Beer-Lambert transit.
+        illumination_velocity (float): Velocity margin [cm/s] by which the
+            PHOENIX wavelength window is widened when an emission model is
+            active, so that gas Doppler-shifted with respect to the star still
+            samples a real stellar spectrum rather than a clamped edge value.
+            The default 100 km/s covers every outflow speed in this repository.
 
     Returns:
         TransitResult: The transit-depth cube and its accessors.
     """
-    atmos = Atmosphere(scenarios, hasOrbitalDopplerShift=hasOrbitalDopplerShift)
+    atmos = Atmosphere(scenarios, hasOrbitalDopplerShift=hasOrbitalDopplerShift,
+                       emission=emission)
     sim = Transit(atmos, wavelengthGrid, spatialGrid)
     sim.addWavelength()
     if use_phoenix_star:
-        sim.planet.hostStar.addFstarFunction(sim.wavelength)
-    R_2D = sim.sumOverChords(max_memory_gb=max_memory_gb)
+        sim.planet.hostStar.addFstarFunction(
+            sim.wavelength,
+            extra_velocity=illumination_velocity if emission is not None else 0.0)
+    out = sim.sumOverChords(max_memory_gb=max_memory_gb,
+                            return_components=emission is not None)
+    if emission is None:
+        R_2D, R_em = out, None
+    else:
+        R_2D, R_em = out['R'], np.asarray(out['emission'])
     orbphase = np.linspace(-spatialGrid.orbphase_border,
                            spatialGrid.orbphase_border, R_2D.shape[0])
     return TransitResult(wavelength_cm=np.asarray(sim.wavelength),
                          R_2D=np.asarray(R_2D), orbphase=orbphase,
-                         planet=sim.planet)
+                         planet=sim.planet, R_emission_2D=R_em)

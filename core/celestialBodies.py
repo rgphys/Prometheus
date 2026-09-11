@@ -307,7 +307,8 @@ class Star:
         F_shifted = 10.**self.Fstar_function(wavelength / shift)
         return F_shifted
 
-    def addFstarFunction(self, wavelength: np.ndarray) -> None:
+    def addFstarFunction(self, wavelength: np.ndarray,
+                         extra_velocity: float = 0.0) -> None:
         """Creates and stores an interpolation function for the stellar spectrum.
 
         This function fetches the PHOENIX spectrum, selects the relevant wavelength
@@ -317,13 +318,20 @@ class Star:
         Args:
             wavelength (np.ndarray): The wavelength grid for the simulation, used to
                 determine the required range of the stellar spectrum.
+            extra_velocity (float): Additional velocity margin [cm/s] to widen the
+                retained wavelength range by. Needed when the spectrum is sampled
+                in a moving parcel's frame (resonance-scattering illumination),
+                where the relevant Doppler shift is the gas velocity, not just
+                the stellar rotation. The interpolator clamps outside its range,
+                so too small a margin would silently flatten the illumination.
         """
         PHOENIX_output = self.getSpectrum()
         w_star = PHOENIX_output[0]
+        v_margin = abs(self.vsiniStarrot) + abs(extra_velocity)
         w_max = np.max(wavelength) * \
-            const.calculateDopplerShift(-self.vsiniStarrot)
+            const.calculateDopplerShift(-v_margin)
         w_min = np.min(wavelength) * \
-            const.calculateDopplerShift(self.vsiniStarrot)
+            const.calculateDopplerShift(v_margin)
         SEL = (w_star >= w_min) * (w_star <= w_max)
         minArg = max(min(np.argwhere(SEL)).item() - 1, 0)
         maxArg = max(np.argwhere(SEL)).item() + 2
@@ -331,6 +339,39 @@ class Star:
         F_0 = PHOENIX_output[1][minArg:maxArg]
         Fstar_function = interp1d(w_starSEL, np.log10(F_0), kind='linear')
         self.Fstar_function = Fstar_function
+
+    def addFstarFunctionFromArrays(self, wavelength: np.ndarray,
+                                   intensity: np.ndarray) -> None:
+        """Attaches an arbitrary stellar spectrum instead of a PHOENIX model.
+
+        The PHOENIX HiRes grid Prometheus downloads stops near 5.5 um, so any
+        mid-infrared work -- a secondary eclipse, a thermal-emission spectrum --
+        needs a spectrum from somewhere else: a model grid that reaches further
+        (BT-Settl, ATLAS9), or the star as actually measured. This is the hook
+        for that. It stores the same ``Fstar_function`` interpolator the rest of
+        the code expects, so every downstream path behaves identically.
+
+        Args:
+            wavelength (np.ndarray): Wavelength grid [cm], strictly increasing.
+            intensity (np.ndarray): Stellar **surface specific intensity**
+                [erg s^-1 cm^-2 cm^-1 sr^-1], i.e. the surface flux divided by
+                pi, matching the convention of :meth:`getSpectrum`. Must be
+                positive; the interpolation is done in log10.
+
+        Raises:
+            ValueError: If the inputs are misshapen, unsorted, or non-positive.
+        """
+        w = np.asarray(wavelength, dtype=float)
+        I = np.asarray(intensity, dtype=float)
+        if w.shape != I.shape or w.ndim != 1:
+            raise ValueError("wavelength and intensity must be 1-D and the "
+                             "same length.")
+        if np.any(np.diff(w) <= 0):
+            raise ValueError("wavelength must be strictly increasing.")
+        if np.any(I <= 0):
+            raise ValueError("intensity must be positive everywhere "
+                             "(it is interpolated in log space).")
+        self.Fstar_function = interp1d(w, np.log10(I), kind='linear')
 
     def getFstarIntegrated(self, wavelength: np.ndarray, grid: Any) -> Tuple[np.ndarray, np.ndarray]:
         """Calculates the stellar flux integrated over the entire disk.

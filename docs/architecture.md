@@ -14,6 +14,8 @@ All code lives in the `core` package:
 | `celestialBodies.py` | `Star`, `Planet`, `Moon`, and `AvailablePlanets` (loads the planet/star catalog from `Resources/*.csv`). Handles orbital positions, line-of-sight velocities, limb darkening, Rossiter–McLaughlin rotation, and PHOENIX stellar spectra. |
 | `geometryHandler.py` | `Grid` — the spatial/temporal discretization: the line-of-sight axis `x`, the sky-plane polar coordinates `(rho, phi)`, and the orbital-phase axis. |
 | `gasProperties.py` | The bulk of the physics: density models (atmospheres and exospheres), absorber/scatterer constituents, the `Atmosphere` aggregator, the `WavelengthGrid`, the Numba optical-depth kernels, and the `Transit` orchestrator. |
+| `emission.py` | Emission physics: the resonance-scattering and thermal source functions, geometric dilution, the absolute stellar illumination, the `EmissionModel` switchboard, and the `g_factor` diagnostic. |
+| `eclipse.py` | Secondary-eclipse geometry: a planet-centred ray grid, an opaque dayside boundary, and the `F_planet / F_star` reduction. |
 | `memoryHandler.py` | Memory-aware batching: estimates per-chord memory and picks a chunk size that fits within a RAM budget. |
 
 The example figure scripts (`fig*.py`) import only from `core.*` for the Prometheus physics; some additionally use the separate `mnemosyne`/`dishoom` packages, which sit on top of Prometheus and are not part of this repository.
@@ -33,7 +35,8 @@ A simulation is built bottom-up from independent objects, then run:
     scatterers)           │     .addScatteringConstituent(...)
                           │     constituent.addLookupFunctionToConstituent(wg)
                           ▼
-              Atmosphere([models], hasOrbitalDopplerShift)
+              Atmosphere([models], hasOrbitalDopplerShift,
+                         emission=EmissionModel(...))   # optional
                           │
    WavelengthGrid ────────┤
    Grid (geometry) ───────┤
@@ -107,6 +110,160 @@ Two JIT kernels do the heavy interpolation, both exploiting the fact that Dopple
 Both are decorated `@njit(parallel=True, fastmath=True)`.
 
 ---
+
+
+## Emission
+
+By default Prometheus solves pure extinction: the only thing gas does to a
+chord is remove photons from it. Passing an `emission.EmissionModel` to
+`Atmosphere` switches to the full formal solution, in which gas also *adds*
+photons:
+
+```
+I = I_star · exp(-tau_total)  +  Σ_i  j_i · Δx · exp(-tau_(i→obs))
+```
+
+`Transit` still owns the first term (it carries the limb darkening and the
+stellar rotation); `Atmosphere.getLOSopticalDepthAndEmission_Batch` returns
+`tau_total` and the sum.
+
+### Source functions
+
+**Resonance scattering of starlight** — the exomoon-cloud term. An atom absorbs
+a stellar photon and re-radiates it isotropically; the fraction landing in the
+observer's beam is set by how much of the sky the star covers at the parcel:
+
+```
+j_scat(λ) = n_abs · sigma(λ) · W(r) · I_star(λ_star)
+W(r) = Omega_star / 4π = 0.5 · (1 - sqrt(1 - (R_star/r)²))    → R_star²/4r²  for r ≫ R_star
+```
+
+`sigma(λ)` is *the same cross section the extinction path uses* — the same line
+list, oscillator strengths, Voigt profile and Doppler shifts — so the emission
+can never be inconsistent with the absorption, and no separate emission line
+data is needed.
+
+`λ_star` is the wavelength the parcel samples the stellar spectrum at, i.e. the
+parcel-frame wavelength Doppler-shifted by the parcel's **radial velocity with
+respect to the star** (`EmissionModel.stellar_doppler`, on by default). This is
+what makes gas sitting in a deep stellar Fraunhofer core scatter weakly, while
+gas that has Doppler-shifted out of the core sees the full continuum and
+scatters strongly. Wind models supply that velocity through
+`calculateRadialVelocityFromStar`; other models are assumed to move
+perpendicular to the star direction (exact for a circular orbit).
+
+**Thermal (LTE) emission** — `j_therm(λ) = n_abs · sigma(λ) · B_λ(T)`,
+Kirchhoff's law, for density models that carry a temperature.
+
+**Aerosol scattering** — same isotropic single-scattering form. The albedo
+splits aerosol extinction into a scattering share, which redirects starlight,
+and a true-absorption share, which emits thermally; Kirchhoff's law then holds
+for every constituent rather than only for the line opacity. The default
+albedo of 1 is a pure scatterer that neither absorbs nor emits. The scattering
+term itself is off by default: real aerosols are strongly forward-scattering,
+so the isotropic assumption is much weaker here than for a resonance line.
+
+### Why the cell loop is inverted
+
+`getLOSopticalDepthAndEmission_Batch` puts the loop over line-of-sight cells on
+the **outside**, unlike `getLOSopticalDepth_Batch`. It has to: the attenuation
+applied to a cell's emission is the optical depth between that cell and the
+observer summed over *every* species, so all constituents' per-cell
+contributions must be in hand at the same time. Everything stays vectorised
+over chords and wavelength, so the peak allocation is still `(n_chords, n_wav)`
+and never the `(chord, x, wavelength)` tensor. The trade-off is that the
+factored `column × sigma` fast path for atoms is unavailable, so an emission run
+costs roughly what a wind run costs. Each cell's emission is integrated exactly for a source function that is
+constant across the cell, `S · (1 - exp(-dtau))`, rather than with a midpoint
+weight. The two agree while cells are thin, but only the exact form survives a
+cell becoming optically thick — which is what makes an opaque layer in LTE
+re-emit exactly what it absorbs. That is checked directly in
+`Tests/EmissionCalibration`, where an opaque grey layer at the surface
+temperature leaves the eclipse depth unchanged at every optical depth from 0.01
+to 99 and at every grid resolution.
+
+### Absolute units
+
+Emissivity is an absolute number of erg, so it cannot be compared against the
+flat `Fstar = 1` placeholder the transmission path is free to use.
+`emission.StellarIntensity` resolves this: it returns the PHOENIX surface
+intensity when one is attached, and a blackbody at `T_eff` otherwise (an
+explicit modelling assumption), plus the `internal_scale` factor that converts
+a physical cgs intensity back into whatever units `F_out` is accumulated in.
+When emission is active, `run_transit` also widens the retained PHOENIX
+wavelength window by `illumination_velocity` (default 100 km/s), because the
+spectrum is now sampled in the *parcel's* frame rather than the observer's.
+
+### Geometry
+
+Two things change in `Transit.sumOverChords`:
+
+- Chords outside the stellar limb are given zero photospheric flux. With the
+  default `rho_border = R_star` every chord is on-disk and this is a no-op; it
+  matters once the sky-plane grid is widened past the limb to capture the
+  off-limb glow of a cloud seen against the dark sky.
+- Chords blocked by an opaque body are still integrated. The body hides only
+  the gas *behind* it, so `x_block` (the body's `x` coordinate) truncates the
+  emission integral while the transmitted term stays zero.
+
+`R = Σ F_in / Σ F_out` can therefore exceed 1 where the gas puts back more light
+than it removes. `sumOverChords(return_components=True)` splits `R` into its
+`transmission` and `emission` parts, and `TransitResult.fill_in_fraction()`
+reports what fraction of the pure-extinction line absorption the scattered
+photons refill.
+
+### Stated approximations
+
+Single scattering; isotropic phase function; coherent scattering in the
+observer frame (exact in the forward-scattering limit, i.e. exactly the
+in-transit geometry); no self-shielding of the incident stellar beam. All four
+are documented at the top of `core/emission.py` with the regime each is valid
+in. Multiple scattering would only *increase* the emission, so the answer here
+is a lower bound on the fill-in.
+
+
+## Secondary eclipses
+
+`emission.py` supplies source functions; `eclipse.py` supplies the other
+observable. A transit integrates chords over a *star*-centred sky plane and
+returns a ratio bounded by 1. An eclipse integrates rays over a *planet*-centred
+disk and returns
+
+```
+depth(λ) = ∫_planet I_p(λ) dA / (π R_star² · I_star(λ))
+```
+
+Each ray at impact parameter `b` carries
+`I = epsilon · B_λ(T_surf(b)) · exp(-tau_above) + I_em`, where `tau_above` is
+the optical depth between the surface and the observer — supplied by the
+emission kernel's `return_visible_tau` — and `I_em` is the overlying gas's own
+emission. Rays with `b > R_p` miss the solid body and see only the limb. For a
+bare uniform dayside this reduces to `epsilon · (R_p/R_star)² · B_λ(T)/I_star`,
+which the quadrature reproduces to ~1e-15.
+
+Rays are placed at orbital phase `pi`, where Prometheus' frame puts the planet
+at `x = -a` with zero line-of-sight velocity — the right kinematics and the
+right star-planet distance for the illumination term. The star enters only
+through the denominator.
+
+The dayside temperature is an **input**: there is no energy-balance or
+heat-redistribution solver. `DaysideSurface` offers a uniform disk (which is
+exactly what a measured brightness temperature means) or the
+instantaneous-reradiation profile `T = T_sub · cos(theta)**0.25`. The ingress
+and egress light curve is not modelled.
+
+### Stellar spectra beyond PHOENIX
+
+The PHOENIX HiRes grid Prometheus downloads stops near 5.5 µm, so it cannot
+supply the denominator for any mid-infrared work.
+`Star.addFstarFunctionFromArrays(wavelength, intensity)` attaches an arbitrary
+spectrum instead — a grid that reaches further (BT-Settl, ATLAS9) or a measured
+one. This matters more than it sounds: a blackbody at `T_eff` over-predicts a
+G8V photosphere's 6–12 µm surface brightness by ~13%, because that continuum
+forms high in the atmosphere where the gas is cooler than `T_eff`. Since
+eclipse depth scales as `1/I_star`, using the blackbody fallback inflates a
+recovered brightness temperature by nearly 200 K. Do not use it for mid-IR
+emission work.
 
 ## Memory-aware batching
 
