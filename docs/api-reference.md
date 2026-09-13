@@ -407,7 +407,8 @@ stated approximations.
 ```python
 EmissionModel(resonant_scattering=True, thermal=False, molecular=False,
               aerosol_scattering=False, aerosol_albedo=1.0,
-              stellar_doppler=True, self_shielding=False)
+              line_thermalisation=None, stellar_doppler=True,
+              self_shielding=False)
 ```
 
 The switchboard; pass an instance to `Atmosphere(..., emission=...)` or
@@ -417,14 +418,19 @@ The switchboard; pass an instance to `Atmosphere(..., emission=...)` or
 |---|---|
 | `resonant_scattering` | Single scattering of starlight by the atomic/ionic line opacity. The exomoon-cloud term. |
 | `thermal` | LTE thermal emission `j = n·sigma·B_λ(T)`; only density models carrying a temperature contribute. |
+| `line_thermalisation` | Photon-destruction probability `ε` of line opacity, `S = (1 − ε)·J + ε·B`. **Required** when `resonant_scattering` and `thermal` are both on (the two limits are not additive) and rejected otherwise. A modelling **assumption**. |
 | `molecular` | Let molecular constituents carry a source term too (they always carry extinction). Off by default — it forces the expensive per-cell molecular interpolation. |
 | `aerosol_scattering` | Isotropic single scattering by aerosol/haze opacity. Off by default; real aerosols are strongly forward-scattering. |
-| `aerosol_albedo` | Single-scattering albedo of the aerosol opacity, splitting its extinction into a scattering share (`albedo`, which redirects starlight) and a true-absorption share (`1 - albedo`, which emits thermally under `thermal`). The default 1.0 is a pure scatterer that neither absorbs nor emits; use 0.0 for a purely absorbing grey opacity. Line opacity is always pure absorption. A modelling **assumption**, not a measurement. |
+| `aerosol_albedo` | Single-scattering albedo of the aerosol opacity, splitting its extinction into a scattering share (`albedo`, which redirects starlight) and a true-absorption share (`1 - albedo`, which emits thermally under `thermal`). The default 1.0 is a pure scatterer that neither absorbs nor emits; use 0.0 for a purely absorbing grey opacity. A modelling **assumption**, not a measurement. |
 | `stellar_doppler` | Sample the stellar spectrum in the parcel's frame, so gas inside a stellar Fraunhofer core is illuminated weakly and Doppler-shifted gas is illuminated strongly. No effect for a flat/blackbody star. |
 | `self_shielding` | Reserved; raises `NotImplementedError` if set. |
 
 Constructing a model with no active source term raises `ValueError` — pass
 `emission=None` for a pure-extinction transit instead.
+
+`source_weights(em, constituent, has_temperature) -> (w_J, w_B)` is the single
+definition of every constituent's source function `S = w_J·J + w_B·B`, shared
+by the chord kernel and `Eclipse1D`.
 
 ### Primitives
 
@@ -437,14 +443,18 @@ Constructing a model with no active source term raises `ValueError` — pass
 ### `StellarIntensity`
 
 ```python
-StellarIntensity(star, wavelength, disk_average=True)
+StellarIntensity(star, wavelength)
 ```
 
-The stellar surface intensity in physical cgs — PHOENIX if attached to the
-star, otherwise a blackbody at `T_eff` (an explicit assumption). Callable on any
-wavelength array whose last axis is monotonically non-decreasing.
-`.internal_scale` converts a physical cgs intensity into the units `Transit`
-accumulates `F_out` in; `.is_phoenix` says which branch is active.
+The disk-averaged stellar surface intensity (flux/π) in physical cgs — the
+attached spectrum if there is one, otherwise a blackbody at `T_eff` (an
+explicit assumption). Independent of limb darkening. Callable on any wavelength
+array whose last axis is monotonically non-decreasing. `.internal_scale`
+converts a physical cgs intensity into the units `Transit` accumulates `F_out`
+in (it carries the CLV disk average `.disk_factor`); `.is_tabulated` (alias
+`.is_phoenix`) says which branch is active. An attached spectrum that does not
+cover `wavelength` raises `ValueError` (it would otherwise be clamped to its edge
+value); the blackbody fallback issues `emission.BlackbodyStarWarning`.
 
 ### Model hooks
 

@@ -332,6 +332,14 @@ class Star:
             const.calculateDopplerShift(-v_margin)
         w_min = np.min(wavelength) * \
             const.calculateDopplerShift(v_margin)
+        if w_min < w_star.min() or w_max > w_star.max():
+            raise ValueError(
+                f"The PHOENIX HiRes spectrum covers {w_star.min() * 1e4:.3f}-"
+                f"{w_star.max() * 1e4:.3f} um but {w_min * 1e4:.3f}-"
+                f"{w_max * 1e4:.3f} um is needed (simulation grid plus velocity "
+                "margin).  Outside its range the spectrum would be clamped to "
+                "its edge value.  Use addFstarFunctionFromArrays with a spectrum "
+                "that covers the grid (e.g. BT-Settl or a measured spectrum).")
         SEL = (w_star >= w_min) * (w_star <= w_max)
         minArg = max(min(np.argwhere(SEL)).item() - 1, 0)
         maxArg = max(np.argwhere(SEL)).item() + 2
@@ -479,7 +487,8 @@ class Planet:
     def getPosition(self, orbphase: float) -> Tuple[float, float]:
         """Calculates the planet's (x, y) coordinates for a given orbital phase.
 
-        Assumes a circular orbit viewed edge-on. The observer is along the x-axis.
+        Assumes a circular orbit viewed edge-on. The observer is at x = +inf, so
+        orbital phase 0 (x_p = +a) is mid-transit and phase pi is mid-eclipse.
 
         Args:
             orbphase (float): The orbital phase in radians (0 at mid-transit).

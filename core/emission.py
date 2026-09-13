@@ -25,14 +25,16 @@ dilution, the g-factor); the line-of-sight integration that uses them lives in
 
 Formal solution
 ---------------
-For a chord running along ``+x`` with the observer at ``x = -inf``, the
-emergent specific intensity is
+For a chord running along ``x`` with the observer at ``x = +inf`` (the
+Prometheus convention: mid-transit puts the planet at ``x = +a``), the emergent
+specific intensity is
 
     I(lambda) = I_star(lambda) * exp(-tau_total)
                 + sum_i  j_i(lambda) * dx * exp(-tau_i->obs)
 
 where ``j`` is the volume emissivity [erg s^-1 cm^-3 sr^-1 cm^-1] and
-``tau_i->obs`` is the optical depth between cell ``i`` and the observer.  The
+``tau_i->obs`` is the optical depth between cell ``i`` and the observer, i.e.
+summed over the cells at larger ``x``.  The
 first term is what Prometheus computed before; this module supplies ``j``.
 
 Source functions
@@ -51,6 +53,22 @@ the same Doppler shifts, and the same line list.
 *Thermal emission* (LTE):
 
     j_therm(lambda) = n_abs * sigma(lambda) * B_lambda(T)
+
+When both are active, line opacity uses the two-level-atom source function
+``S = (1 - eps) J + eps B`` with an explicit thermalisation probability
+``eps`` (:attr:`EmissionModel.line_thermalisation`); the two terms are never
+simply added, which would exceed both physical limits.  The complete rules,
+including the aerosol albedo split, live in :func:`source_weights`.
+
+Validation status
+-----------------
+Validated against real data: the bare-surface eclipse path (Planck source,
+stellar normalisation, band averaging) on the 55 Cnc e MIRI spectrum and on
+TRAPPIST-1 b/c and LHS 3844 b (``Tests/EmissionCalibration``,
+``Tests/EmissionReleaseCheck``).  Validated by internal consistency only
+(Kirchhoff's law, sign tests, solver agreement): thermal emission from gas,
+molecular emission, and **resonance scattering**, for which no published
+measurement isolating the term has yet been compared.
 
 Approximations, stated explicitly
 ---------------------------------
@@ -79,6 +97,7 @@ Approximations, stated explicitly
 Created 2026-09-11.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -137,75 +156,152 @@ def dilution_factor(r: np.ndarray, R_star: float) -> np.ndarray:
 # Stellar illumination
 # --------------------------------------------------------------------------
 
-class StellarIntensity:
-    """The stellar surface intensity in *physical* cgs units.
+class BlackbodyStarWarning(UserWarning):
+    """Emission or an eclipse is using a blackbody at ``T_eff`` as the star.
 
-    Prometheus' internal ``Fstar`` is either a PHOENIX surface intensity (real
-    cgs) or a flat ``1.0`` placeholder, because only the ratio ``F_in / F_out``
-    matters for a transmission spectrum.  Emission breaks that scale invariance:
-    the emissivity is an absolute number of erg, so it has to be compared
-    against an absolute stellar intensity.  This class provides that, and also
-    the conversion factor back into whatever internal units the transit
-    normalisation is using.
+    Not an error: it is a stated modelling assumption.  But eclipse depth scales
+    as ``1 / I_star``, and real photospheres depart strongly from a blackbody in
+    the infrared (measured: 55 Cnc 25% too bright at 7-12 um, TRAPPIST-1 ~50%
+    too bright at 15 um, biasing a recovered brightness temperature by up to
+    ~100 K; see ``Tests/EmissionReleaseCheck``).  Silence it deliberately with
+    ``warnings.simplefilter('ignore', BlackbodyStarWarning)``.
+    """
+
+
+def check_spectrum_coverage(star: Any, wavelength: np.ndarray) -> None:
+    """Raise if the star's attached spectrum does not cover ``wavelength``.
+
+    The interpolator clamps to the edge value outside its range, which would
+    silently turn a truncated spectrum (e.g. PHOENIX HiRes, which stops near
+    5.5 um) into a flat, wrong star.
+
+    Args:
+        star (Any): A :class:`celestialBodies.Star` with ``Fstar_function`` set.
+        wavelength (np.ndarray): Wavelengths that will be evaluated [cm].
+
+    Raises:
+        ValueError: If any wavelength lies outside the tabulated range.
+    """
+    x = np.asarray(star.Fstar_function.x, dtype=float)
+    lo, hi = float(x.min()), float(x.max())
+    w = np.asarray(wavelength, dtype=float)
+    tol = 1e-9 * hi
+    if w.min() < lo - tol or w.max() > hi + tol:
+        raise ValueError(
+            f"The stellar spectrum covers {lo * 1e4:.4f}-{hi * 1e4:.4f} um but "
+            f"{w.min() * 1e4:.4f}-{w.max() * 1e4:.4f} um is requested.  Outside "
+            "its range the spectrum would be clamped to its edge value.  Attach "
+            "a spectrum that covers the grid (Star.addFstarFunctionFromArrays "
+            "with BT-Settl/ATLAS or a measured spectrum).")
+
+
+class StellarIntensity:
+    """The disk-averaged stellar surface intensity in *physical* cgs units.
+
+    Prometheus' internal ``Fstar`` is either a PHOENIX spectrum (surface flux
+    divided by pi, see :meth:`celestialBodies.Star.getSpectrum`) or a flat
+    ``1.0`` placeholder, because only the ratio ``F_in / F_out`` matters for a
+    transmission spectrum.  Emission breaks that scale invariance: the
+    emissivity is an absolute number of erg, so it has to be compared against
+    an absolute stellar intensity.  This class provides that, and the factor
+    that converts it into the units of ``Transit``'s ``F_out``.
+
+    Two quantities are kept strictly apart:
+
+    * The **physical** intensity returned by ``__call__`` is the disk-averaged
+      surface intensity ``F_surface / pi``.  That is what illuminates a distant
+      parcel (``J = W * I``) and what normalises an eclipse depth
+      (``F_star = pi R_star^2 * I``).  Limb darkening does not change it: the
+      stellar flux is fixed and limb darkening only redistributes it over the
+      disk.
+    * The **internal** unit of the transit chord sum.  ``Transit`` treats
+      ``Fstar`` as the *disk-centre* intensity and multiplies it by the CLV
+      profile, so its disk-integrated ``F_out`` is ``pi R^2 * Fstar * D``, with
+      ``D`` the disk-average of the CLV profile.  ``internal_scale`` carries
+      that factor ``D`` so emission lands in the same units as ``F_out``.
 
     Args:
         star (Any): A :class:`celestialBodies.Star`.
-        wavelength (np.ndarray): The simulation wavelength grid [cm]; used only
-            for the blackbody fallback bookkeeping.
-        disk_average (bool): Multiply by the limb-darkening disk-average factor
-            ``1 - u1/3 - u2/6`` so that the intensity used to *illuminate* the
-            gas is the disk-averaged one rather than the disk-centre value.
+        wavelength (np.ndarray): The simulation wavelength grid [cm].  An
+            attached spectrum must cover it (``ValueError`` otherwise); with no
+            spectrum a :class:`BlackbodyStarWarning` is issued.
 
     Attributes:
-        is_phoenix (bool): True if a PHOENIX spectrum is attached to the star.
+        is_tabulated (bool): True if a stellar spectrum (PHOENIX, or one
+            attached with ``addFstarFunctionFromArrays``) is attached.
+        disk_factor (np.ndarray): Disk average of the CLV profile the transit
+            chord sum uses, ``2 * int_0^1 CLV(mu) mu dmu``, per wavelength.
         internal_scale (np.ndarray): Multiply a physical cgs intensity by this
             to express it in the same units as ``Transit``'s ``F_out``.
     """
 
-    def __init__(self, star: Any, wavelength: np.ndarray,
-                 disk_average: bool = True):
+    #: Gauss-Legendre nodes for the disk average of a tabulated CLV profile.
+    _N_MU = 64
+
+    def __init__(self, star: Any, wavelength: np.ndarray):
         self.star = star
         self.wavelength = np.asarray(wavelength, dtype=float)
-        self.is_phoenix = getattr(star, 'Fstar_function', None) is not None
+        self.is_tabulated = getattr(star, 'Fstar_function', None) is not None
+        self.disk_factor = self._clvDiskFactor(star, self.wavelength)
 
-        u1 = getattr(star, 'CLV_u1', 0.0) or 0.0
-        u2 = getattr(star, 'CLV_u2', 0.0) or 0.0
-        self.disk_factor = (1.0 - u1 / 3.0 - u2 / 6.0) if disk_average else 1.0
-
-        if self.is_phoenix:
+        if self.is_tabulated:
+            check_spectrum_coverage(star, self.wavelength)
             self._x = star.Fstar_function.x
             self._y = star.Fstar_function.y
-            # Internal units already are physical cgs surface intensity.
-            self.internal_scale = np.ones_like(self.wavelength)
+            # Internal Fstar is the tabulated intensity itself.
+            self.internal_scale = self.disk_factor
         else:
-            # Flat star: the internal unit is "disk-centre intensity = 1", so a
-            # physical intensity has to be divided by the physical disk-centre
-            # intensity.  ASSUMPTION (not a measurement): the photosphere
-            # radiates as a blackbody at T_eff.
+            warnings.warn(
+                f"No stellar spectrum attached: the star is modelled as a "
+                f"blackbody at T_eff = {star.T_eff:.0f} K.  In the infrared "
+                "this can bias eclipse depths by tens of percent; attach a "
+                "spectrum with Star.addFstarFunction or "
+                "Star.addFstarFunctionFromArrays.",
+                BlackbodyStarWarning, stacklevel=3)
+            # Flat star: internal Fstar = 1 at disk centre.  ASSUMPTION (not a
+            # measurement): the photosphere radiates as a blackbody at T_eff,
+            # i.e. a disk-averaged intensity B_lambda(T_eff).
             self._x = None
             self._y = None
-            I_ref = planck_lambda(self.wavelength, star.T_eff)
-            self.internal_scale = 1.0 / I_ref
+            self.internal_scale = self.disk_factor / planck_lambda(
+                self.wavelength, star.T_eff)
+
+    @classmethod
+    def _clvDiskFactor(cls, star: Any, wavelength: np.ndarray) -> np.ndarray:
+        """Disk average of the CLV profile used by the transit chord sum."""
+        clv_function = getattr(star, 'CLV_function', None)
+        if clv_function is None:
+            u1 = getattr(star, 'CLV_u1', 0.0) or 0.0
+            u2 = getattr(star, 'CLV_u2', 0.0) or 0.0
+            return np.full_like(wavelength, 1.0 - u1 / 3.0 - u2 / 6.0)
+        nodes, weights = np.polynomial.legendre.leggauss(cls._N_MU)
+        mu = 0.5 * (nodes + 1.0)
+        profile = np.asarray(clv_function(mu, wavelength), dtype=float)
+        return 2.0 * np.sum((0.5 * weights * mu)[:, np.newaxis] * profile,
+                            axis=0)
 
     def __call__(self, wavelength: np.ndarray) -> np.ndarray:
-        """Surface intensity [erg s^-1 cm^-2 cm^-1 sr^-1] at given wavelengths.
+        """Disk-averaged surface intensity [erg s^-1 cm^-2 cm^-1 sr^-1].
 
         Args:
             wavelength (np.ndarray): Wavelength [cm].  The last axis must be
                 monotonically non-decreasing (true of every Doppler-shifted
-                grid in Prometheus) when a PHOENIX spectrum is used.
+                grid in Prometheus) when a tabulated spectrum is used.
 
         Returns:
             np.ndarray: Intensity, same shape as ``wavelength``.
         """
-        if self.is_phoenix:
+        if self.is_tabulated:
             # Local import: avoids a circular import at module load time.
             from .gasProperties import n_interp_log
-            I = n_interp_log(np.ascontiguousarray(wavelength, dtype=float),
-                             self._x, self._y, 0.0)
-        else:
-            I = planck_lambda(wavelength, self.star.T_eff)
-        return I * self.disk_factor
+            return n_interp_log(np.ascontiguousarray(wavelength, dtype=float),
+                                self._x, self._y, 0.0)
+        return planck_lambda(wavelength, self.star.T_eff)
+
+    @property
+    def is_phoenix(self) -> bool:
+        """Backwards-compatible alias of :attr:`is_tabulated`."""
+        return self.is_tabulated
 
 
 # --------------------------------------------------------------------------
@@ -221,29 +317,51 @@ class EmissionModel:
     with a source term.  Leaving it as ``None`` reproduces the previous
     behaviour bit-for-bit.
 
+    Source functions
+    ----------------
+    Every opacity source ``i`` contributes extinction ``kappa_i`` and an
+    emissivity ``kappa_i * S_i``; :func:`source_weights` is the single
+    definition, shared by the chord kernel and :class:`eclipse.Eclipse1D`.
+
+    * **Line opacity** (atoms, ions, and molecules when ``molecular``) follows
+      the two-level-atom source function
+
+          S = (1 - eps) * J + eps * B_lambda(T),
+
+      where ``J`` is the diluted stellar mean intensity and ``eps`` the
+      photon-destruction (thermalisation) probability.  ``resonant_scattering``
+      alone is ``eps = 0``; ``thermal`` alone is ``eps = 1``; both together
+      require ``line_thermalisation`` to be given explicitly, because the two
+      limits are not additive.  Where a density model carries no temperature
+      (the exosphere family) there is no ``B``, and line opacity scatters with
+      weight ``1 - eps``.
+    * **Aerosol opacity** splits by the single-scattering albedo ``omega``:
+      ``S = omega * J`` (if ``aerosol_scattering``) ``+ (1 - omega) * B`` (if
+      ``thermal``).
+
     Attributes:
-        resonant_scattering (bool): Single scattering of starlight by the
-            atomic/ionic line opacity.  This is the exomoon-cloud term.
-        thermal (bool): LTE thermal emission, ``j = n sigma B_lambda(T)``.
-            Only density models that carry a temperature (the
-            ``CollisionalAtmosphere`` family) contribute.
+        resonant_scattering (bool): Single scattering of starlight by line
+            opacity.  This is the exomoon-cloud term.
+        thermal (bool): LTE thermal emission from line opacity and from the
+            absorbing share of aerosol opacity.  Only density models that carry
+            a temperature (the ``CollisionalAtmosphere`` family) contribute.
         molecular (bool): Include molecular constituents in the emission terms
             as well as in the extinction.  Off by default because it forces the
             expensive per-cell molecular interpolation.
         aerosol_scattering (bool): Single scattering of starlight by aerosol /
-            haze opacity, with an isotropic phase function and a grey single-
-            scattering albedo.  Off by default: real aerosols are strongly
-            forward-scattering, so the isotropic assumption is much weaker here
-            than it is for a resonance line.
+            haze opacity, with an isotropic phase function.  Off by default:
+            real aerosols are strongly forward-scattering, so the isotropic
+            assumption is much weaker here than it is for a resonance line.
         aerosol_albedo (float): Single-scattering albedo of the aerosol
-            opacity, splitting its extinction into a scattering share
-            ``albedo`` and a true-absorption share ``1 - albedo``.  The
-            scattering share redirects starlight; the absorption share emits
-            thermally under ``thermal``, as Kirchhoff's law requires.  The
-            default 1.0 is a pure scatterer, which neither absorbs nor emits;
-            set it to 0.0 for a purely absorbing grey opacity.  A modelling
-            ASSUMPTION, not a measurement.  Atomic, ionic and molecular line
-            opacity is always treated as pure absorption.
+            opacity.  The default 1.0 is a pure scatterer, which neither absorbs
+            nor emits; set it to 0.0 for a purely absorbing grey opacity.  A
+            modelling ASSUMPTION, not a measurement.
+        line_thermalisation (Optional[float]): Photon-destruction probability
+            ``eps`` of line opacity, in [0, 1].  Required when both
+            ``resonant_scattering`` and ``thermal`` are on; not accepted
+            otherwise.  A modelling ASSUMPTION, not a measurement: it is the
+            ratio of collisional de-excitation to total de-excitation, and
+            depends on the density and the line.
         stellar_doppler (bool): Sample the stellar spectrum at the wavelength
             seen in the *parcel's* frame, i.e. Doppler-shifted by the parcel's
             radial velocity with respect to the star.  This is what makes gas
@@ -259,6 +377,7 @@ class EmissionModel:
     molecular: bool = False
     aerosol_scattering: bool = False
     aerosol_albedo: float = 1.0
+    line_thermalisation: Optional[float] = None
     stellar_doppler: bool = True
     self_shielding: bool = False
 
@@ -275,6 +394,27 @@ class EmissionModel:
                 "for a pure-extinction transit.")
         if not 0.0 <= self.aerosol_albedo <= 1.0:
             raise ValueError("aerosol_albedo must lie in [0, 1].")
+        both = self.resonant_scattering and self.thermal
+        if both and self.line_thermalisation is None:
+            raise ValueError(
+                "resonant_scattering and thermal are both on, so line opacity "
+                "needs S = (1 - eps) J + eps B: pass line_thermalisation=eps "
+                "in [0, 1].  The two limits are not additive.  Use "
+                "resonant_scattering=False for pure LTE emission (eps = 1).")
+        if not both and self.line_thermalisation is not None:
+            raise ValueError(
+                "line_thermalisation only applies when resonant_scattering "
+                "and thermal are both on.")
+        if self.line_thermalisation is not None and not (
+                0.0 <= self.line_thermalisation <= 1.0):
+            raise ValueError("line_thermalisation must lie in [0, 1].")
+
+    @property
+    def epsilon(self) -> float:
+        """Photon-destruction probability of line opacity."""
+        if self.line_thermalisation is not None:
+            return float(self.line_thermalisation)
+        return 1.0 if self.thermal else 0.0
 
     @property
     def needs_atoms(self) -> bool:
@@ -284,7 +424,39 @@ class EmissionModel:
     @property
     def needs_aerosols(self) -> bool:
         """True if scattering constituents carry a source term."""
-        return self.aerosol_scattering
+        return self.aerosol_scattering or (self.thermal
+                                           and self.aerosol_albedo < 1.0)
+
+
+def source_weights(em: EmissionModel, constituent: Any,
+                   has_temperature: bool) -> tuple:
+    """Weights of ``J`` and ``B`` in one constituent's source function.
+
+    The single definition of the source-function rules in
+    :class:`EmissionModel`, used by every solver so they cannot drift apart.
+
+    Args:
+        em (EmissionModel): The emission configuration.
+        constituent (Any): An atomic, molecular or scattering constituent.
+        has_temperature (bool): Whether the density model supplies a
+            temperature, i.e. whether ``B_lambda(T)`` exists.
+
+    Returns:
+        Tuple[float, float]: ``(w_J, w_B)`` such that the constituent's source
+        function is ``S = w_J * J + w_B * B``.  ``(0, 0)`` means pure
+        extinction.
+    """
+    if getattr(constituent, 'isScatterer', False):
+        omega = em.aerosol_albedo
+        w_J = omega if em.aerosol_scattering else 0.0
+        w_B = (1.0 - omega) if (em.thermal and has_temperature) else 0.0
+        return w_J, w_B
+    if getattr(constituent, 'isMolecule', False) and not em.molecular:
+        return 0.0, 0.0
+    eps = em.epsilon
+    w_J = (1.0 - eps) if em.resonant_scattering else 0.0
+    w_B = eps if (em.thermal and has_temperature) else 0.0
+    return w_J, w_B
 
 
 # --------------------------------------------------------------------------

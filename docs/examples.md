@@ -283,8 +283,9 @@ print(f"{depth:.3f} % absorption, {glow*1e6:.1f} ppm peak emission, "
 ```
 
 For a hot Jupiter the fill-in is small — the star subtends only
-`W = (R_star/a)²/4 ≈ 4e-3` of the sky at the planet, so scattering returns a few
-tenths of a percent of what absorption removes. That is a useful result in
+`W = (R_star/a)²/4 ≈ 4e-3` of the sky at the planet, so scattering returns only
+~0.03% of what absorption removes for the Io-like cloud above (measured in
+`Tests/EmissionCalibration/fig_emission_spectra.py`). That is a useful result in
 itself: it is the quantitative justification for treating a transit as pure
 absorption. The emission term matters where the denominator is small — off the
 stellar disk, out of transit, and at high spectral resolution.

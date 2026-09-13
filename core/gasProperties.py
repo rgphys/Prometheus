@@ -1179,10 +1179,11 @@ class RadialWindExosphere(EvaporativeExosphere):
         r = self.planet.getDistanceFromPlanet(x_grid, phi_batch, rho_batch, orbphase_batch)
         v_radial = self._wind_velocity(r)  # (n_chords, n_x)
         x_p = self.planet.a * np.cos(orbphase_batch)        # (n_chords,)
-        dx = x_grid[np.newaxis, :] - x_p[:, np.newaxis]    # (n_chords, n_x); positive = behind planet
+        dx = x_grid[np.newaxis, :] - x_p[:, np.newaxis]    # (n_chords, n_x); positive = observer side
         r_safe = np.where(r > 0, r, 1.0)
-        # +x component of the radial outflow (away-from-observer = redshift > 0),
-        # matching the sign convention of planet.getLOSvelocity.
+        # +x component of the radial outflow.  The observer is at x = +inf, so
+        # this is positive toward the observer (blueshift), matching
+        # planet.getLOSvelocity and constants.calculateDopplerShift.
         return v_radial * dx / r_safe
 
     def calculateRadialVelocityFromStar(self, x_grid: np.ndarray, phi_batch: np.ndarray,
@@ -2319,14 +2320,19 @@ class Atmosphere:
         """Optical depth **and** emergent emission for a batch of chords.
 
         Solves the formal radiative-transfer equation along each chord instead
-        of applying Beer-Lambert alone.  With the observer at ``x = -inf`` and
-        cells ordered by increasing ``x``,
+        of applying Beer-Lambert alone.  The observer is at ``x = +inf``, the
+        convention of the rest of Prometheus: mid-transit (orbital phase 0)
+        puts the planet at ``x = +a``, between the star and the observer, and
+        :func:`constants.calculateDopplerShift` counts motion along ``+x`` as
+        toward the observer.  So a cell is attenuated by the cells at *larger*
+        ``x``, and
 
             I = I_star * exp(-tau_total) + sum_i j_i * dx * exp(-tau_i->obs),
 
-        and this method returns ``tau_total`` and the sum, i.e. everything
-        except the stellar term (which ``Transit`` owns, because it carries the
-        limb darkening and the stellar rotation).
+        with ``tau_i->obs`` summed over ``x > x_i``.  This method returns
+        ``tau_total`` and the sum, i.e. everything except the stellar term
+        (which ``Transit`` owns, because it carries the limb darkening and the
+        stellar rotation).
 
         Unlike :meth:`getLOSopticalDepth_Batch`, the loop over cells is the
         *outer* loop.  It has to be: the attenuation of a cell's emission
@@ -2342,10 +2348,11 @@ class Atmosphere:
         midpoint weight.  The two agree while cells are thin, but only the
         exact form stays right once a cell becomes optically thick -- which is
         what makes an opaque layer in LTE correctly re-emit everything it
-        absorbs (Kirchhoff's law).
+        absorbs (Kirchhoff's law).  The source function of each constituent is
+        defined once, in :func:`emission.source_weights`.
 
         Args:
-            x_grid (np.ndarray): LOS grid (n_x,) [cm].
+            x_grid (np.ndarray): LOS grid (n_x,) [cm], increasing.
             phi_batch (np.ndarray): Azimuthal angles (n_chords,) [rad].
             rho_batch (np.ndarray): Projected radii (n_chords,) [cm].
             orbphase_batch (np.ndarray): Orbital phases (n_chords,) [rad].
@@ -2354,9 +2361,10 @@ class Atmosphere:
             stellarIntensity (emission.StellarIntensity): Physical-cgs stellar
                 surface intensity, used as the illumination for scattering.
             x_block (Optional[np.ndarray]): For each chord, the ``x`` coordinate
-                of the nearest opaque body along it, or ``+inf`` if the chord is
-                unobstructed.  Gas behind that body is hidden from the observer
-                and is excluded from the emission integral.
+                of the opaque body nearest the observer along it, or ``-inf``
+                if the chord is unobstructed.  Gas at ``x <= x_block`` is
+                behind that body, hidden from the observer, and excluded from
+                the emission integral.
             return_visible_tau (bool): Also return the optical depth accumulated
                 over the *visible* cells only, i.e. between the occulting body
                 and the observer.  That is what attenuates radiation emitted by
@@ -2391,7 +2399,7 @@ class Atmosphere:
         if x_block is None:
             visible = None
         else:
-            visible = (x_grid[np.newaxis, :] < np.asarray(x_block)[:, np.newaxis])
+            visible = (x_grid[np.newaxis, :] > np.asarray(x_block)[:, np.newaxis])
 
         prepared = [
             self._prepareBatch(m, x_grid, phi_batch, rho_batch,
@@ -2404,12 +2412,17 @@ class Atmosphere:
             P['B_iso'] = (emis.planck_lambda(P['shifted_wav'], P['T_iso'])
                           if (em.thermal and P['T_iso'] is not None
                               and P['T_field'] is None) else None)
+            has_T = P['T_field'] is not None or P['T_iso'] is not None
+            P['weights'] = [emis.source_weights(em, c, has_T)
+                            for c, _ in P['columns']]
 
         tau = np.zeros((n_chords, n_wav))
         tau_visible = np.zeros((n_chords, n_wav)) if return_visible_tau else None
         I_em = np.zeros((n_chords, n_wav))
 
-        for xi in range(n_x):
+        # March from the observer (largest x) inward, so that ``tau`` always
+        # holds the optical depth between the current cell and the observer.
+        for xi in range(n_x - 1, -1, -1):
             dtau = np.zeros((n_chords, n_wav))
             j_nu = np.zeros((n_chords, n_wav))
 
@@ -2443,7 +2456,8 @@ class Atmosphere:
                 else:
                     B_cell = P['B_iso']
 
-                for constituent, n_abs in P['columns']:
+                for (constituent, n_abs), (w_J, w_B) in zip(P['columns'],
+                                                            P['weights']):
                     col = n_abs[:, xi, np.newaxis]
 
                     if constituent.isMolecule:
@@ -2465,49 +2479,24 @@ class Atmosphere:
                                 constituent.lookupOffset)
                         sigma = n_interp_linear_rows(
                             lam_gas, constituent.wav_grid, sigma_native)
-                        emits = em.molecular
-                        scatters = em.molecular and em.resonant_scattering
-
                     elif getattr(constituent, 'isScatterer', False):
                         sigma = np.broadcast_to(
                             constituent.getSigmaAbs(wavelength)[np.newaxis, :],
                             (n_chords, n_wav))
-                        # Thermal emission from the absorbed share of aerosol
-                        # extinction is required by Kirchhoff whenever the
-                        # albedo is below 1, independent of whether the
-                        # scattering term is switched on.
-                        emits = em.aerosol_scattering or (
-                            em.thermal and em.aerosol_albedo < 1.0)
-                        scatters = em.aerosol_scattering
-
                     else:  # atoms / ions
                         sigma = constituent.getSigmaAbs(lam_gas)
-                        emits = em.needs_atoms
-                        scatters = em.resonant_scattering
 
                     dtau += col * sigma * delta_x
 
-                    if not emits:
+                    if w_J == 0.0 and w_B == 0.0:
                         continue
-
-                    # Extinction splits into scattering and true absorption.
-                    # Line opacity is taken as pure absorption (albedo 0), so
-                    # it both scatters resonantly and emits thermally in LTE.
-                    # Aerosol opacity splits by the single-scattering albedo:
-                    # the scattered share redirects starlight, the absorbed
-                    # share emits thermally.  Kirchhoff's law then holds for
-                    # every constituent.
-                    is_aerosol = getattr(constituent, 'isScatterer', False)
-                    albedo = em.aerosol_albedo if is_aerosol else 1.0
                     source = np.zeros((n_chords, n_wav))
-                    if scatters:
+                    if w_J > 0.0:
                         if illum is None:
                             illum = _illumination()
-                        source = source + albedo * illum
-                    if em.thermal and B_cell is not None:
-                        absorbed_share = (1.0 - albedo) if is_aerosol else 1.0
-                        if absorbed_share > 0.0:
-                            source = source + absorbed_share * B_cell
+                        source = source + w_J * illum
+                    if w_B > 0.0 and B_cell is not None:
+                        source = source + w_B * B_cell
                     j_nu += col * sigma * source
 
             if j_nu.any():
@@ -2865,19 +2854,26 @@ class Transit:
             F_star_batch = F_star_batch * on_disk[idx, None]
 
             # Opaque bodies: which chords are blocked, and at what x the block
-            # sits (gas in front of it is still visible in emission).
+            # sits.  The observer is at x = +inf, so gas at larger x than the
+            # nearest occulter is in front of it and still visible in emission.
             x_p = self.planet.a * np.cos(orb[idx])
             y_p = self.planet.a * np.sin(orb[idx])
             is_blocked = (np.sqrt((y[idx] - y_p)**2 + z[idx]**2) < self.planet.R)
-            x_block = np.where(is_blocked, x_p, np.inf)
+            x_block = np.where(is_blocked, x_p, -np.inf)
             for densityDistribution in self.atmosphere.densityDistributionList:
                 if densityDistribution.hasMoon:
                     moon = densityDistribution.moon
                     x_moon, y_moon = moon.getPosition(orb[idx])
                     blocked_moon = ((y[idx] - y_moon)**2 + z[idx]**2 < moon.R**2)
                     is_blocked |= blocked_moon
-                    x_block = np.minimum(
-                        x_block, np.where(blocked_moon, x_moon, np.inf))
+                    x_block = np.maximum(
+                        x_block, np.where(blocked_moon, x_moon, -np.inf))
+            # The stellar disk hides gas behind the star from the emission
+            # term (a torus far side, a moon near secondary eclipse).  The
+            # extinction path is left untouched so that emission=None stays
+            # bit-identical to the pure Beer-Lambert transit.
+            x_block_em = np.where(on_disk[idx], np.maximum(x_block, 0.0),
+                                  x_block)
 
             F_out = rho[idx, None] * F_star_batch
             F_in = np.zeros_like(F_out)
@@ -2896,7 +2892,7 @@ class Transit:
                 # show the gas in front of the occulting body.
                 tau, I_em = self.atmosphere.getLOSopticalDepthAndEmission_Batch(
                     x_grid, phi[idx], rho[idx], orb[idx], self.wavelength,
-                    delta_x, stellarIntensity, x_block=x_block
+                    delta_x, stellarIntensity, x_block=x_block_em
                 )
                 F_in[active] = F_out[active] * np.exp(-tau[active])
                 F_em = rho[idx, None] * I_em * emission_scale[None, :]

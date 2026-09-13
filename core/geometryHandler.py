@@ -20,7 +20,9 @@ class Grid:
     evaluated in the simulation.
 
     The coordinate system is defined as follows:
-    - The observer is at x = -infinity.
+    - The observer is at x = +infinity: mid-transit (orbital phase 0) puts the
+      planet at x = +a, between the star and the observer, and motion along +x
+      is toward the observer (see constants.calculateDopplerShift).
     - The star is at the origin (0,0,0).
     - The x-axis is the line of sight through the star's center.
     - The y-z plane is the plane of the sky.

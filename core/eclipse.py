@@ -38,10 +38,13 @@ only.
 
 Geometry and phase
 ------------------
-The rays are placed at orbital phase ``pi``, i.e. superior conjunction, where
-Prometheus' star-centred frame puts the planet at ``x = -a`` with zero
-line-of-sight velocity — the correct kinematics for an eclipse, and the correct
-star-planet distance for the illumination term.  The star is *not* added to any
+The rays are placed at orbital phase ``pi``, i.e. superior conjunction.  The
+observer is at ``x = +inf`` (the convention of the rest of Prometheus, where
+mid-transit puts the planet at ``x = +a``), so the planet sits behind the star
+at ``x = -a`` with zero line-of-sight velocity, and its star-facing hemisphere,
+``x > -a``, is the one the observer sees.  That is the correct kinematics for an
+eclipse, the correct star-planet distance for the illumination term, and the
+correct side for any gas that is not spherically symmetric.  The star is *not* added to any
 ray: the stellar contribution enters only through the denominator.  This module
 therefore models the planet's own emission; it does not model the ingress and
 egress light curve.
@@ -181,6 +184,11 @@ class Eclipse:
         self.phi_steps = int(phi_steps)
         self.x_border = (float(x_border) if x_border is not None
                          else 10.0 * float(planet.R))
+        if atmosphere is not None and self.x_border <= self.R_top:
+            raise ValueError(
+                "x_border is the half-length of the line of sight, centred on "
+                "the planet; it must exceed R_top or the grid never reaches "
+                "the gas above the surface.")
         self.x_steps = int(x_steps)
         self.orbphase = np.pi          # superior conjunction
         self.stellarIntensity = emis.StellarIntensity(planet.hostStar,
@@ -214,12 +222,12 @@ class Eclipse:
         n_wav = len(self.wavelength)
 
         hits = b < R_p
-        # Where the ray meets the surface.  The observer is at x = -inf, so the
-        # near face of the planet is the smaller-x root.
+        # Where the ray meets the surface.  The observer is at x = +inf, so the
+        # near face of the planet is the larger-x root.
         x_p = float(self.planet.a) * np.cos(self.orbphase)
         x_surface = np.where(hits,
-                             x_p - np.sqrt(np.clip(R_p ** 2 - b ** 2, 0.0, None)),
-                             np.inf)
+                             x_p + np.sqrt(np.clip(R_p ** 2 - b ** 2, 0.0, None)),
+                             -np.inf)
 
         I = np.zeros((len(b), n_wav))
         if self.surface is not None:
@@ -352,8 +360,10 @@ class Eclipse1D:
             ``CollisionalAtmosphere`` family, with its constituents attached.
             ``None`` models a bare body.
         emission (Optional[Any]): An :class:`emission.EmissionModel`.  Required
-            when ``density_model`` is given.  ``stellar_doppler`` has no effect
-            here: a static 1-D profile has no velocity field.
+            when ``density_model`` is given.  Source functions follow
+            :func:`emission.source_weights`, exactly as in the chord kernel.
+            ``stellar_doppler`` has no effect here: a static 1-D profile has no
+            velocity field.
         n_layers (int): Radial layers between the surface and ``R_top``.
         R_top (Optional[float]): Top of the atmosphere [cm].  Defaults to the
             radius at which the model's density has fallen by ``exp(-n_scale)``
@@ -459,17 +469,19 @@ class Eclipse1D:
                 hi = mid
         return hi
 
-    #  opacity
-    def layerOpacity(self) -> np.ndarray:
-        """Extinction coefficient per layer, ``sum_i n_i sigma_i(lambda)``.
+    #  opacity and emissivity
+    def _layerCrossSections(self):
+        """Per-constituent absorber density and cross section on the layers.
 
         Returns:
-            np.ndarray: ``(n_layers, n_wav)`` in cm^-1.
+            List[Tuple[Any, np.ndarray, np.ndarray]]: ``(constituent, n_abs,
+            sigma)`` with ``n_abs`` of shape ``(n_layers,)`` [cm^-3] and
+            ``sigma`` of shape ``(n_layers, n_wav)`` [cm^2].
         """
-        n_lay, n_wav = len(self.r_mid), len(self.wavelength)
-        kappa = np.zeros((n_lay, n_wav))
+        n_lay = len(self.r_mid)
+        out = []
         if self.model is None:
-            return kappa
+            return out
         P = np.clip(self.n_layer * const.k_B * self.T_layer, 1e-30, None)
         for c in self.model.constituents:
             n_abs = self.n_layer * c.chi
@@ -487,29 +499,56 @@ class Eclipse1D:
             else:
                 sigma = c.getSigmaAbs(
                     np.ascontiguousarray(np.tile(self.wavelength, (n_lay, 1))))
-            kappa += n_abs[:, np.newaxis] * sigma
-        return kappa
+            out.append((c, n_abs, sigma))
+        return out
 
-    def layerSource(self) -> np.ndarray:
-        """Source function per layer, ``(n_layers, n_wav)`` in cgs intensity.
+    def layerOpacityAndEmissivity(self):
+        """Extinction coefficient and emissivity per layer.
 
-        Thermal emission uses ``B_lambda(T)``; resonance/aerosol scattering uses
-        the diluted stellar intensity at the planet's orbital distance.  Both are
-        weighted the same way as in the chord kernel, so the two solvers agree.
+        The source function of each constituent comes from
+        :func:`emission.source_weights`, the same rule the chord kernel uses,
+        so the two solvers agree for every ``EmissionModel``.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: ``kappa`` [cm^-1] and ``j``
+            [erg s^-1 cm^-3 cm^-1 sr^-1], both ``(n_layers, n_wav)``.
         """
         n_lay, n_wav = len(self.r_mid), len(self.wavelength)
+        kappa = np.zeros((n_lay, n_wav))
+        j = np.zeros((n_lay, n_wav))
         if self.model is None or n_lay == 0:
-            return np.zeros((n_lay, n_wav))
-        S = np.zeros((n_lay, n_wav))
-        if self.em.thermal:
-            S += emis.planck_lambda(self.wavelength[np.newaxis, :],
-                                    self.T_layer[:, np.newaxis])
-        if self.em.resonant_scattering or self.em.aerosol_scattering:
-            W = emis.dilution_factor(float(self.planet.a),
-                                     self.planet.hostStar.R)
-            I_star = self.stellarIntensity(self.wavelength[np.newaxis, :])[0]
-            S += W * I_star[np.newaxis, :]
-        return S
+            return kappa, j
+        B = emis.planck_lambda(self.wavelength[np.newaxis, :],
+                               self.T_layer[:, np.newaxis])
+        W = emis.dilution_factor(float(self.planet.a), self.planet.hostStar.R)
+        J = W * self.stellarIntensity(self.wavelength[np.newaxis, :])
+        for c, n_abs, sigma in self._layerCrossSections():
+            k = n_abs[:, np.newaxis] * sigma
+            kappa += k
+            w_J, w_B = emis.source_weights(self.em, c, has_temperature=True)
+            if w_J > 0.0:
+                j += k * (w_J * J)
+            if w_B > 0.0:
+                j += k * (w_B * B)
+        return kappa, j
+
+    def layerOpacity(self) -> np.ndarray:
+        """Extinction coefficient per layer, ``sum_i n_i sigma_i(lambda)``.
+
+        Returns:
+            np.ndarray: ``(n_layers, n_wav)`` in cm^-1.
+        """
+        return self.layerOpacityAndEmissivity()[0]
+
+    def layerSource(self) -> np.ndarray:
+        """Effective source function per layer, ``j / kappa``.
+
+        Returns:
+            np.ndarray: ``(n_layers, n_wav)`` in cgs intensity; zero where the
+            layer has no opacity.
+        """
+        kappa, j = self.layerOpacityAndEmissivity()
+        return np.divide(j, kappa, out=np.zeros_like(j), where=kappa > 0.0)
 
     #  geometry
     def _rayGrid(self):
@@ -560,8 +599,7 @@ class Eclipse1D:
         R_p = float(self.planet.R)
         n_wav = len(self.wavelength)
         I = np.zeros((len(b), n_wav))
-        kappa = self.layerOpacity()
-        S = self.layerSource()
+        kappa, emissivity = self.layerOpacityAndEmissivity()
         I_surf = (self.surface.intensity(self.wavelength, b, R_p)
                   if self.surface is not None else np.zeros((len(b), n_wav)))
 
@@ -589,7 +627,7 @@ class Eclipse1D:
                              -np.expm1(-np.where(dtau > 1e-8, dtau, 1.0))
                              / np.where(dtau > 1e-8, dtau, 1.0),
                              1.0 - 0.5 * dtau)
-                out = out * np.exp(-dtau) + S[k] * dtau * w
+                out = out * np.exp(-dtau) + emissivity[k] * d * w
             I[j] = out
         return I
 

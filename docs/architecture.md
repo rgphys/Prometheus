@@ -63,7 +63,7 @@ The flow:
 
 `geometryHandler.Grid` uses a star-centered frame (defined in its docstring):
 
-- The observer is at `x = -∞`; the star sits at the origin.
+- The observer is at `x = +∞`; the star sits at the origin. Mid-transit (orbital phase 0) puts the planet at `x = +a`, between the star and the observer, and `constants.calculateDopplerShift` counts motion along `+x` as toward the observer.
 - The `x`-axis is the line of sight through the star's center; the `y`–`z` plane is the sky plane.
 - `rho` is the radial distance from the origin in the sky plane; `phi` is the azimuthal angle.
 
@@ -155,6 +155,16 @@ perpendicular to the star direction (exact for a circular orbit).
 **Thermal (LTE) emission** — `j_therm(λ) = n_abs · sigma(λ) · B_λ(T)`,
 Kirchhoff's law, for density models that carry a temperature.
 
+**Both at once.** Scattering and thermal emission are the two limits of the
+two-level-atom source function, `S = (1 − ε)·J + ε·B`, and are not additive:
+summing them exceeds both limits. With both switched on, line opacity therefore
+needs an explicit photon-destruction probability `ε`
+(`EmissionModel.line_thermalisation`), a modelling assumption that depends on
+the density and the line. `resonant_scattering` alone is `ε = 0`; `thermal`
+alone is `ε = 1`. The rules for every constituent live in one function,
+`emission.source_weights`, used by both the chord kernel and `Eclipse1D`, so
+the two solvers cannot drift apart.
+
 **Aerosol scattering** — same isotropic single-scattering form. The albedo
 splits aerosol extinction into a scattering share, which redirects starlight,
 and a true-absorption share, which emits thermally; Kirchhoff's law then holds
@@ -186,10 +196,14 @@ to 99 and at every grid resolution.
 
 Emissivity is an absolute number of erg, so it cannot be compared against the
 flat `Fstar = 1` placeholder the transmission path is free to use.
-`emission.StellarIntensity` resolves this: it returns the PHOENIX surface
-intensity when one is attached, and a blackbody at `T_eff` otherwise (an
-explicit modelling assumption), plus the `internal_scale` factor that converts
-a physical cgs intensity back into whatever units `F_out` is accumulated in.
+`emission.StellarIntensity` resolves this: it returns the disk-averaged
+surface intensity (flux/π) of the attached spectrum, or a blackbody at `T_eff`
+otherwise (an explicit modelling assumption). Limb darkening does not change
+that number — it redistributes a fixed flux over the disk — so it is what
+illuminates the gas and what normalises an eclipse depth. The transit chord sum
+instead treats `Fstar` as the disk-*centre* intensity and multiplies by the CLV
+profile, so its `F_out` carries the CLV disk average `D`; `internal_scale`
+carries that factor so emission lands in the same units.
 When emission is active, `run_transit` also widens the retained PHOENIX
 wavelength window by `illumination_velocity` (default 100 km/s), because the
 spectrum is now sampled in the *parcel's* frame rather than the observer's.
@@ -203,14 +217,43 @@ Two things change in `Transit.sumOverChords`:
   matters once the sky-plane grid is widened past the limb to capture the
   off-limb glow of a cloud seen against the dark sky.
 - Chords blocked by an opaque body are still integrated. The body hides only
-  the gas *behind* it, so `x_block` (the body's `x` coordinate) truncates the
-  emission integral while the transmitted term stays zero.
+  the gas *behind* it (at smaller `x`, since the observer is at `+∞`), so
+  `x_block` (the `x` of the occulter nearest the observer) truncates the
+  emission integral while the transmitted term stays zero. On-disk chords also
+  hide gas behind the star from the emission term; the extinction path is
+  unchanged, so `emission=None` stays bit-identical to Beer–Lambert.
 
 `R = Σ F_in / Σ F_out` can therefore exceed 1 where the gas puts back more light
 than it removes. `sumOverChords(return_components=True)` splits `R` into its
 `transmission` and `emission` parts, and `TransitResult.fill_in_fraction()`
 reports what fraction of the pure-extinction line absorption the scattered
 photons refill.
+
+### Validation status
+
+- **Validated against real data:** the bare-surface eclipse path (Planck
+  source, stellar normalisation, band averaging, brightness-temperature
+  inversion). The 55 Cnc e JWST/MIRI spectrum is reproduced to 0.5σ, and the
+  TRAPPIST-1 b, TRAPPIST-1 c and LHS 3844 b eclipses to within 1σ.
+- **Validated by internal consistency only:** thermal emission from gas,
+  molecular emission, and **resonance scattering**. These pass Kirchhoff's
+  law, sign tests and solver-agreement tests, but no measurement isolating
+  them has been compared yet.
+
+### Stellar spectra are the dominant systematic
+
+Eclipse depth scales as `1/I_star`. An attached spectrum must cover every
+wavelength used: `StellarIntensity` and `Star.addFstarFunction` raise
+`ValueError` rather than clamp to the edge value. With no spectrum attached,
+emission and eclipses fall back to a blackbody at `T_eff` and issue an
+`emission.BlackbodyStarWarning`. Measured offsets for that fallback:
+
+- **55 Cnc:** 25% too bright at 7–12 µm.
+- **TRAPPIST-1:** ~50% too bright at 15 µm, which biases the recovered
+  brightness temperature by ~100 K.
+
+BT-Settl is still 12–15% too bright for TRAPPIST-1. Use a measured stellar flux
+where one exists.
 
 ### Stated approximations
 
@@ -242,9 +285,11 @@ bare uniform dayside this reduces to `epsilon · (R_p/R_star)² · B_λ(T)/I_sta
 which the quadrature reproduces to ~1e-15.
 
 Rays are placed at orbital phase `pi`, where Prometheus' frame puts the planet
-at `x = -a` with zero line-of-sight velocity — the right kinematics and the
-right star-planet distance for the illumination term. The star enters only
-through the denominator.
+behind the star at `x = -a` with zero line-of-sight velocity — the right
+kinematics and the right star-planet distance for the illumination term. With
+the observer at `+∞`, the visible hemisphere is the star-facing one (`x > -a`),
+which matters for any gas that is not spherically symmetric. The star enters
+only through the denominator.
 
 The dayside temperature is an **input**: there is no energy-balance or
 heat-redistribution solver. `DaysideSurface` offers a uniform disk (which is
