@@ -182,6 +182,26 @@ PowerLawAtmosphere(T, P_0, q, planet)        # n ∝ (R_p / r)^q
 - `q` — power-law index (`PowerLawAtmosphere` only).
 - `planet` — a `Planet`.
 
+#### `TPProfileHydrostaticAtmosphere` (gas-giant emission)
+
+```python
+TPProfileHydrostaticAtmosphere(planet, logP_nodes_bar, T_nodes, mu,
+                               P_ref=1e4, P_bottom=1e8, P_top=10.0, n_grid=600)
+```
+
+A hydrostatic column with an arbitrary T(P):
+
+- **Profile:** temperatures at pressure nodes, interpolated with PCHIP in log P.
+  The profile can invert without spurious extrema between nodes, and is
+  isothermal beyond the outermost nodes.
+- **Radii:** integrated exactly for piecewise-constant T from `planet.R` at `P_ref`.
+  The pressure the transit radius corresponds to is a modelling assumption.
+- **Range:** runs from `P_bottom` (default 100 bar) to `P_top` (default 1e-5 bar),
+  with no surface.
+- **Helpers:** `radiusAtPressure(P)`, `temperatureAtPressure(P)`, `r_bottom`,
+  `r_top`, `T_bottom`. Use `radiusAtPressure` to build log-P layer edges for
+  `Eclipse1D(r_edges=...)`.
+
 ---
 
 ### Evaporative exospheres
@@ -300,6 +320,36 @@ TabulatedAerosol(chi=1.0, filepath='', extrapolate='edge', P_top=None)
 - `chi` — particle-to-gas abundance ratio.
 - `P_top` — optional cloud-top pressure (barye); opacity applies only where local gas pressure ≥ `P_top` (collisional/temperature-bearing host models only).
 - Scattering is treated as extinction out of the beam; no phase function or multiple scattering is modeled, and no Doppler shift is applied to continuum opacity.
+
+#### Continuum constituents (`core/continuum.py`)
+
+Opacities that depend on the local density and temperature rather than a
+per-particle cross section. They are marked `isContinuum = True` and supply
+`absorptionCoefficient(n_tot, T, wavelength) -> kappa [cm^-1]`. All three
+solvers (transit extinction, the emission kernel, `Eclipse1D`) accept them.
+They are true absorbers: thermal emission only, never scattering.
+
+```python
+CIAConstituent(pair, chi_A, chi_B)        # pair in {'H2-H2', 'H2-He'}
+HMinusConstituent(chi_H, chi_e)           # H- bound-free + free-free
+```
+
+- **`CIAConstituent`**
+  - **Formula:** `kappa = chi_A chi_B n^2 k(nu, T)`, from HITRAN (2011
+    H2-H2 and H2-He).
+  - **Data:** a compact grid in `Resources/cia/`, rebuilt by
+    `build_cia_grids.py`; the interpolation error is < 0.07% (99th percentile).
+  - **Coverage:** zero outside the tabulated wavenumbers (H2-H2 1–500 µm,
+    H2-He 0.5–500 µm). A temperature outside 200–3000 K (H2-H2) or
+    200–5000 K (H2-He) raises.
+- **`HMinusConstituent`**
+  - **Source:** John (1988, A&A 193, 189) Eqs. 3–6, transcribed from the
+    paper. Two widely used codes disagree with it; see
+    `Tests/ContinuumOpacity/validate_hminus.py`.
+  - **Formula:** `kappa = (k_bf + k_ff) n_H P_e`.
+  - **Inputs:** `chi_H` and `chi_e` are inputs. There is no equilibrium
+    chemistry.
+  - **Validity:** the free-free fit raises outside 1400–10080 K.
 
 Example dict form:
 
@@ -507,6 +557,28 @@ radius; raise it to include an extended atmosphere's limb.
 | `brightnessTemperature(depth=None)` | Temperature of a uniform blackbody disk giving that depth, per wavelength. |
 | `emergentIntensity()` | Per-ray emergent intensity, `(n_rays, n_wav)`. |
 | `rayGrid()` | `(b, theta, weights)`; `weights` are `b·db·dθ` and sum to the projected area. |
+
+### `Eclipse1D`
+
+```python
+Eclipse1D(planet, wavelength, surface=None, density_model=None, emission=None,
+          n_layers=160, R_top=None, n_scale=25.0, n_mu=12, n_limb=12, r_edges=None)
+```
+
+- **What it is:** an eclipse of a spherically symmetric atmosphere on radial
+  layers, using exact chord path lengths. It is much faster than `Eclipse`,
+  which makes retrievals practical.
+- **Rays:** the disk is Gauss–Legendre in μ (`n_mu`), plus `n_limb` rays
+  across the annulus between `planet.R` and the top. For gas giants the limb
+  carries several percent of the depth, so do not set `n_limb=0` there.
+- **Layers:** `r_edges` overrides the uniform radial layers; it must start at
+  `planet.R`.
+- **Formal solution:** numba kernels, exact for a constant source per layer.
+- **Sources:** the source functions are `emission.source_weights`, identical
+  to the chord kernel's.
+
+Methods: `depth()`, `bandDepth(lo, hi, depth=None)`, `emergentIntensity()`,
+`layerOpacityAndEmissivity()`, `layerOpacity()`, `layerSource()`.
 
 ### Module functions
 

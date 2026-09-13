@@ -65,11 +65,93 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+from numba import njit, prange
 
 from . import constants as const
 from . import emission as emis
 from . import geometryHandler as geom
 
+
+#: Optical depth beyond which remaining layers cannot contribute:
+#: exp(-45) = 2.9e-20 of the emergent intensity.
+_TAU_CUTOFF = 45.0
+
+
+@njit(parallel=True, cache=True)
+def _formal_solution_disk(ds, kappa, emissivity, I_surf):
+    """Emergent intensity of rays that end on the surface.
+
+    Marches each ray from the top of the atmosphere down, carrying the
+    transmission to the observer multiplicatively, so the closed form
+    I = I_surf exp(-tau_tot) + sum_k j_k ds_k w_k exp(-tau_(>k))
+    needs one exponential per step and no (ray, layer, wavelength)
+    temporaries.  Once the optical depth above exceeds ``_TAU_CUTOFF`` the
+    deeper layers and the surface contribute < 3e-20 and the march stops.
+
+    Args:
+        ds (ndarray): Path length per ray and layer (n_rays, n_layers) [cm].
+        kappa, emissivity (ndarray): (n_layers, n_wav).
+        I_surf (ndarray): Surface intensity (n_rays, n_wav).
+    """
+    n_r, n_l = ds.shape
+    n_w = kappa.shape[1]
+    out = np.empty((n_r, n_w))
+    for j in prange(n_r):
+        for w in range(n_w):
+            above = 0.0
+            trans = 1.0
+            em = 0.0
+            for k in range(n_l - 1, -1, -1):
+                d = ds[j, k]
+                if d <= 0.0:
+                    continue
+                dt = kappa[k, w] * d
+                e = np.exp(-dt)
+                wt = (1.0 - e) / dt if dt > 1e-8 else 1.0 - 0.5 * dt
+                em += emissivity[k, w] * d * wt * trans
+                trans *= e
+                above += dt
+                if above > _TAU_CUTOFF:
+                    break
+            out[j, w] = I_surf[j, w] * trans + em
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _formal_solution_limb(ds, kappa, emissivity):
+    """Emergent intensity of limb rays (each shell crossed twice).
+
+    Near-side emission from shell k is attenuated by tau_(>k); far-side emission
+    by 2 T1 - dtau_k - tau_(>k), with T1 the one-sided optical depth.  Both
+    exponents are >= tau_(>k), so once that passes ``_TAU_CUTOFF`` nothing
+    deeper contributes and the march stops.
+    """
+    n_r, n_l = ds.shape
+    n_w = kappa.shape[1]
+    out = np.empty((n_r, n_w))
+    for j in prange(n_r):
+        for w in range(n_w):
+            T1 = 0.0
+            for k in range(n_l):
+                T1 += kappa[k, w] * ds[j, k]
+            above = 0.0
+            trans = 1.0
+            em = 0.0
+            for k in range(n_l - 1, -1, -1):
+                d = ds[j, k]
+                if d <= 0.0:
+                    continue
+                dt = kappa[k, w] * d
+                e = np.exp(-dt)
+                wt = (1.0 - e) / dt if dt > 1e-8 else 1.0 - 0.5 * dt
+                far = 2.0 * T1 - dt - above
+                em += emissivity[k, w] * d * wt * (trans + (np.exp(-far) if far < _TAU_CUTOFF else 0.0))
+                trans *= e
+                above += dt
+                if above > _TAU_CUTOFF:
+                    break
+            out[j, w] = em
+    return out
 
 @dataclass
 class DaysideSurface:
@@ -371,6 +453,10 @@ class Eclipse1D:
         n_scale (float): Number of density e-foldings spanned when ``R_top`` is
             chosen automatically.
         n_mu (int): Gauss-Legendre nodes across the solid disk.
+        r_edges (Optional[np.ndarray]): Explicit layer boundaries [cm],
+            increasing, starting at ``planet.R``.  Overrides ``n_layers`` and
+            ``R_top``; use it for layers uniform in log pressure, which a
+            gas-giant column spanning many scale heights needs.
         n_limb (int): Rays across the limb annulus above the solid body, where
             the atmosphere glows against the sky.  Set to 0 to integrate the
             solid disk only, which is what makes this directly comparable to
@@ -388,7 +474,8 @@ class Eclipse1D:
                  density_model: Optional[Any] = None,
                  emission: Optional[Any] = None,
                  n_layers: int = 160, R_top: Optional[float] = None,
-                 n_scale: float = 25.0, n_mu: int = 12, n_limb: int = 12):
+                 n_scale: float = 25.0, n_mu: int = 12, n_limb: int = 12,
+                 r_edges: Optional[np.ndarray] = None):
         if surface is None and density_model is None:
             raise ValueError("An eclipse needs something that emits: pass a "
                              "DaysideSurface, a density model, or both.")
@@ -409,6 +496,11 @@ class Eclipse1D:
         if density_model is None:
             self.R_top = R_p
             self.r_edges = np.array([R_p])
+        elif r_edges is not None:
+            self.r_edges = np.asarray(r_edges, dtype=float)
+            if abs(self.r_edges[0] - R_p) > 1e-6 * R_p or np.any(np.diff(self.r_edges) <= 0):
+                raise ValueError("r_edges must increase and start at planet.R.")
+            self.R_top = float(self.r_edges[-1])
         else:
             self.R_top = (float(R_top) if R_top is not None
                           else self._findTop(n_scale))
@@ -473,17 +565,25 @@ class Eclipse1D:
     def _layerCrossSections(self):
         """Per-constituent absorber density and cross section on the layers.
 
-        Returns:
-            List[Tuple[Any, np.ndarray, np.ndarray]]: ``(constituent, n_abs,
-            sigma)`` with ``n_abs`` of shape ``(n_layers,)`` [cm^-3] and
-            ``sigma`` of shape ``(n_layers, n_wav)`` [cm^2].
+        A generator, so only one constituent's ``(n_layers, n_wav)`` array is
+        alive at a time; at native opacity resolution that is the difference
+        between ~50 MB and several hundred MB per model.
+
+        Yields:
+            Tuple[Any, np.ndarray, np.ndarray]: ``(constituent, n_abs, sigma)``
+            with ``n_abs`` of shape ``(n_layers,)`` [cm^-3] and ``sigma`` of
+            shape ``(n_layers, n_wav)`` [cm^2].
         """
         n_lay = len(self.r_mid)
-        out = []
         if self.model is None:
-            return out
+            return
         P = np.clip(self.n_layer * const.k_B * self.T_layer, 1e-30, None)
         for c in self.model.constituents:
+            if getattr(c, 'isContinuum', False):
+                # kappa directly: return it as sigma with a unit "column".
+                yield (c, np.ones(n_lay), c.absorptionCoefficient(
+                    self.n_layer, self.T_layer, self.wavelength))
+                continue
             n_abs = self.n_layer * c.chi
             if c.isMolecule:
                 from .gasProperties import (_bilinear_PT_interp_Tvec,
@@ -499,8 +599,7 @@ class Eclipse1D:
             else:
                 sigma = c.getSigmaAbs(
                     np.ascontiguousarray(np.tile(self.wavelength, (n_lay, 1))))
-            out.append((c, n_abs, sigma))
-        return out
+            yield (c, n_abs, sigma)
 
     def layerOpacityAndEmissivity(self):
         """Extinction coefficient and emissivity per layer.
@@ -603,7 +702,29 @@ class Eclipse1D:
         I_surf = (self.surface.intensity(self.wavelength, b, R_p)
                   if self.surface is not None else np.zeros((len(b), n_wav)))
 
+        # Closed-form formal solution for all rays (numba kernels above);
+        # identical to the recursion below, which is kept for reference and
+        # for any ray the kernels do not cover.
+        done = np.zeros(len(b), dtype=bool)
+        if len(self.r_mid):
+            z = np.sqrt(np.clip(self.r_edges[np.newaxis, :] ** 2
+                                - b[:, np.newaxis] ** 2, 0.0, None))
+            ds_all = np.ascontiguousarray(np.diff(z, axis=1))          # (rays, layers)
+            kap = np.ascontiguousarray(kappa)
+            emi = np.ascontiguousarray(emissivity)
+            if np.any(hits):
+                jh = np.where(hits)[0]
+                I[jh] = _formal_solution_disk(np.ascontiguousarray(ds_all[jh]), kap, emi,
+                                              np.ascontiguousarray(I_surf[jh]))
+                done[jh] = True
+            miss = np.where(~hits)[0]
+            if len(miss):
+                I[miss] = _formal_solution_limb(np.ascontiguousarray(ds_all[miss]), kap, emi)
+                done[miss] = True
+
         for j in range(len(b)):
+            if done[j]:
+                continue
             ds = self._pathLengths(b[j], self.r_edges)
             if hits[j]:
                 # Integrate along the direction of propagation, which starts at

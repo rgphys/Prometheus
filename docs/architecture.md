@@ -229,6 +229,28 @@ than it removes. `sumOverChords(return_components=True)` splits `R` into its
 reports what fraction of the pure-extinction line absorption the scattered
 photons refill.
 
+### Continuum opacity
+
+Line-by-line molecular tables omit the continua that set an H2-dominated
+photosphere. `core/continuum.py` adds two of them.
+
+**Collision-induced absorption (H2–H2, H2–He).** `kappa = n_A n_B k(ν, T)`
+from HITRAN, so it grows as P² and bounds the atmosphere from below.
+
+**H⁻ (John 1988).**
+- **Coefficients:** transcribed from the paper itself.
+  - **TauREx 3.3.2** evaluates the bound-free polynomial wrongly (×3.6 low at
+    the 0.85 µm peak).
+  - **TauREx and ExoJAX** each carry a one-digit typo in the free-free table.
+  - **John's Table 1:** its bound-free part is misprinted by ×10 relative to
+    his own Eqs. 3–5. The equations reproduce the paper's stated free-free
+    fractions (34%, 6%, <1%) and the Saha prefactor; the ×10 contradicts both.
+- **Inputs:** H⁻ needs atomic-H and electron abundances as inputs. There is no
+  equilibrium chemistry in Prometheus.
+
+Both are true absorption: under `thermal` they emit at B(T), and they never
+scatter. Validation: `Tests/ContinuumOpacity`.
+
 ### Validation status
 
 - **Validated against real data:** the bare-surface eclipse path (Planck

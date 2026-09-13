@@ -482,6 +482,112 @@ class NonIsothermalHydrostaticAtmosphere(CollisionalAtmosphere):
         return T
 
 
+class TPProfileHydrostaticAtmosphere(CollisionalAtmosphere):
+    """Hydrostatic atmosphere with an arbitrary temperature-pressure profile.
+
+    Built for gas-giant emission retrievals: the column runs from ``P_bottom``
+    (deep, opaque) to ``P_top`` with no solid surface, and T(P) is given at
+    pressure nodes and interpolated monotonically (PCHIP) in log P, so the
+    profile can be isothermal, decreasing or inverted without introducing
+    spurious extrema between nodes.
+
+    Hydrostatic equilibrium with point-mass gravity and the ideal gas law,
+
+        dr = -(k_B T(P) r^2 / (mu G M)) d ln P,
+
+    is integrated outward and inward from a reference pressure ``P_ref`` placed
+    at the planet's radius ``planet.R``.  Which pressure the measured transit
+    radius corresponds to is a modelling ASSUMPTION (commonly ~1-10 mbar for
+    hot Jupiters); it sets the emitting area and is degenerate with temperature.
+
+    Mixing ratios are carried by the constituents; ``mu`` is the mean molecular
+    mass of the gas [g] and is held constant with height.
+
+    Args:
+        planet (Any): Host :class:`celestialBodies.Planet`; ``planet.R`` is the
+            radius at ``P_ref``.
+        logP_nodes_bar (array): log10 pressure of the T nodes [bar], any order.
+        T_nodes (array): Temperatures at the nodes [K].
+        mu (float): Mean molecular mass [g].
+        P_ref (float): Reference pressure at ``planet.R`` [cgs].
+        P_bottom (float): Bottom of the column [cgs].  Default 100 bar.
+        P_top (float): Top of the column [cgs].  Default 1e-5 bar.
+        n_grid (int): Pressure samples used for the radius integration.
+
+    Attributes:
+        isNonIsothermal (bool): True; T varies along each line of sight.
+        r_bottom, r_top (float): Radii of the column boundaries [cm].
+        T_bottom (float): Temperature at ``P_bottom`` [K].
+    """
+
+    def __init__(self, planet: Any, logP_nodes_bar, T_nodes, mu: float,
+                 P_ref: float = 1e4, P_bottom: float = 1e8, P_top: float = 10.0,
+                 n_grid: int = 600):
+        from scipy.interpolate import PchipInterpolator
+        order = np.argsort(np.asarray(logP_nodes_bar, dtype=float))
+        xs = np.asarray(logP_nodes_bar, dtype=float)[order]
+        ys = np.asarray(T_nodes, dtype=float)[order]
+        if np.any(ys <= 0.0):
+            raise ValueError("Node temperatures must be positive.")
+        if not P_top < P_ref < P_bottom:
+            raise ValueError("Need P_top < P_ref < P_bottom.")
+        self._T_of_logP = PchipInterpolator(xs, ys, extrapolate=False)
+        self._logP_nodes = (xs[0], xs[-1])
+        self._T_edges = (ys[0], ys[-1])
+        super().__init__(float(np.interp(np.log10(P_ref / 1e6), xs, ys)), P_ref)
+        self.planet = planet
+        self.mu = float(mu)
+        self.isNonIsothermal = True
+
+        lnP = np.linspace(np.log(P_bottom), np.log(P_top), int(n_grid))
+        T = self.temperatureAtPressure(np.exp(lnP))
+        c0 = const.G * self.mu * planet.M / const.k_B
+        i_ref = int(np.argmin(np.abs(lnP - np.log(P_ref))))
+        lnP[i_ref] = np.log(P_ref)
+        r = np.empty_like(lnP)
+        r[i_ref] = planet.R
+        # dr/dlnP = -T r^2 / c0  <=>  d(1/r)/dlnP = T / c0, so across a step at
+        # (midpoint) constant T:  1/r_new = 1/r_old + T_mid (lnP_new - lnP_old) / c0.
+        # Exact for an isothermal column.
+        for i in range(i_ref + 1, len(lnP)):            # outward (P decreasing)
+            Tm = 0.5 * (T[i] + T[i - 1])
+            r[i] = 1.0 / (1.0 / r[i - 1] + Tm * (lnP[i] - lnP[i - 1]) / c0)
+        for i in range(i_ref - 1, -1, -1):              # inward (P increasing)
+            Tm = 0.5 * (T[i] + T[i + 1])
+            r[i] = 1.0 / (1.0 / r[i + 1] + Tm * (lnP[i] - lnP[i + 1]) / c0)
+        if np.any(np.diff(r) <= 0.0) or np.any(r <= 0.0):
+            raise ValueError("Hydrostatic integration failed (atmosphere unbound "
+                             "or too hot for this gravity).")
+        self._r = r
+        self._lnP = lnP
+        self._T = T
+        self._logn = lnP - np.log(const.k_B * T)
+        self.r_bottom, self.r_top = float(r[0]), float(r[-1])
+        self.T_bottom = float(T[0])
+
+    def temperatureAtPressure(self, P: np.ndarray) -> np.ndarray:
+        """T(P) [K]; isothermal beyond the outermost nodes."""
+        logP = np.log10(np.asarray(P, dtype=float) / 1e6)
+        T = self._T_of_logP(np.clip(logP, *self._logP_nodes))
+        return np.asarray(T, dtype=float)
+
+    def radiusAtPressure(self, P: np.ndarray) -> np.ndarray:
+        """r(P) [cm] within the column."""
+        return np.interp(-np.log(np.asarray(P, dtype=float)), -self._lnP, self._r)
+
+    def getReferenceNumberDensity(self) -> float:
+        return self.P_0 / (const.k_B * self.T)
+
+    def calculateNumberDensity(self, x, phi, rho, orbphase):
+        r = self.planet.getDistanceFromPlanet(x, phi, rho, orbphase)
+        logn = np.interp(r, self._r, self._logn)
+        return np.where((r >= self.r_bottom) & (r <= self.r_top), np.exp(logn), 0.0)
+
+    def calculateTemperature(self, x, phi, rho, orbphase):
+        r = self.planet.getDistanceFromPlanet(x, phi, rho, orbphase)
+        return np.interp(r, self._r, self._T)
+
+
 class PowerLawAtmosphere(CollisionalAtmosphere):
     """An atmosphere with a density profile following a power law.
 
@@ -2140,6 +2246,15 @@ class Atmosphere:
                     x_grid, phi_batch, rho_batch, orbphase_batch)
 
             for constituent in dist_model.constituents:
+                if getattr(constituent, 'isContinuum', False):
+                    # Collision-induced absorption / H-: kappa from the local
+                    # density and temperature, smooth in wavelength, so no
+                    # Doppler shift is applied.
+                    T_loc = T_field if nonisothermal else np.full_like(n_tot, dist_model.T)
+                    for xi in range(n_x_local):
+                        total_tau += constituent.absorptionCoefficient(
+                            n_tot[:, xi], T_loc[:, xi], wavelength) * delta_x
+                    continue
                 if constituent.isMolecule:
                     #  Optimizations 2 + 4: decomposed P-T interpolation 
                     # 1) bilinear-interpolate over (P, T) per x-step on native wav grid
@@ -2287,7 +2402,9 @@ class Atmosphere:
         # scale-height and cloud-top rules applied once here rather than per cell.
         columns = []
         for constituent in dist_model.constituents:
-            if getattr(constituent, 'isScatterer', False):
+            if getattr(constituent, 'isContinuum', False):
+                n_abs = n_tot                      # unused: kappa comes from the constituent
+            elif getattr(constituent, 'isScatterer', False):
                 n_abs = n_tot * constituent.chi
                 fH = getattr(constituent, 'scale_height_factor', 1.0)
                 if fH != 1.0 and hasattr(dist_model, 'getReferenceNumberDensity'):
@@ -2460,7 +2577,12 @@ class Atmosphere:
                                                             P['weights']):
                     col = n_abs[:, xi, np.newaxis]
 
-                    if constituent.isMolecule:
+                    if getattr(constituent, 'isContinuum', False):
+                        T_cell = (P['T_field'][:, xi] if P['T_field'] is not None
+                                  else np.full(n_chords, P['T_iso']))
+                        k_cell = constituent.absorptionCoefficient(
+                            P['n_tot'][:, xi], T_cell, wavelength)
+                    elif constituent.isMolecule:
                         if P['T_field'] is not None:
                             T_cell = P['T_field'][:, xi]
                             P_cell = np.clip(
@@ -2485,8 +2607,10 @@ class Atmosphere:
                             (n_chords, n_wav))
                     else:  # atoms / ions
                         sigma = constituent.getSigmaAbs(lam_gas)
+                    if not getattr(constituent, 'isContinuum', False):
+                        k_cell = col * sigma
 
-                    dtau += col * sigma * delta_x
+                    dtau += k_cell * delta_x
 
                     if w_J == 0.0 and w_B == 0.0:
                         continue
@@ -2497,7 +2621,7 @@ class Atmosphere:
                         source = source + w_J * illum
                     if w_B > 0.0 and B_cell is not None:
                         source = source + w_B * B_cell
-                    j_nu += col * sigma * source
+                    j_nu += k_cell * source
 
             if j_nu.any():
                 # Exact integral of a piecewise-constant source through the

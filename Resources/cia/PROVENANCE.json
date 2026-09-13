@@ -1,0 +1,43 @@
+{
+  "description": "Compact HITRAN CIA grids for Prometheus (log10 k, cm^5 molecule^-2)",
+  "references": [
+    "HITRAN CIA database, main 2011 files for H2-H2 and H2-He; see the HITRAN CIA page for the underlying computations"
+  ],
+  "built_by": "build_cia_grids.py",
+  "grids": {
+    "H2-H2": {
+      "source": "https://hitran.org/data/CIA/main/H2-H2_2011.cia",
+      "n_T": 113,
+      "T_range_K": [
+        200.0,
+        3000.0
+      ],
+      "nu_range_cm1": [
+        20.0,
+        10000.0
+      ],
+      "step_cm1": 2.0,
+      "pointwise_rel_error_median": 7.993605777301127e-15,
+      "pointwise_rel_error_p99": 0.0005602237387661857,
+      "band100cm1_rel_error_max": 0.0001625898524442171,
+      "size_MB": 1.32
+    },
+    "H2-He": {
+      "source": "https://hitran.org/data/CIA/main/H2-He_2011.cia",
+      "n_T": 193,
+      "T_range_K": [
+        200.0,
+        5000.0
+      ],
+      "nu_range_cm1": [
+        20.0,
+        20000.0
+      ],
+      "step_cm1": 2.0,
+      "pointwise_rel_error_median": 7.771561172376096e-15,
+      "pointwise_rel_error_p99": 0.0006289303213163899,
+      "band100cm1_rel_error_max": 0.00015912407654816718,
+      "size_MB": 5.1
+    }
+  }
+}

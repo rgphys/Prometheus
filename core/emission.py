@@ -335,6 +335,8 @@ class EmissionModel:
       limits are not additive.  Where a density model carries no temperature
       (the exosphere family) there is no ``B``, and line opacity scatters with
       weight ``1 - eps``.
+    * **Continuum opacity** (collision-induced absorption, H-) is true
+      absorption: ``S = B`` under ``thermal``, nothing otherwise.
     * **Aerosol opacity** splits by the single-scattering albedo ``omega``:
       ``S = omega * J`` (if ``aerosol_scattering``) ``+ (1 - omega) * B`` (if
       ``thermal``).
@@ -446,6 +448,9 @@ def source_weights(em: EmissionModel, constituent: Any,
         function is ``S = w_J * J + w_B * B``.  ``(0, 0)`` means pure
         extinction.
     """
+    if getattr(constituent, 'isContinuum', False):
+        # CIA and H- are true absorption in LTE: thermal emission only.
+        return 0.0, (1.0 if (em.thermal and has_temperature) else 0.0)
     if getattr(constituent, 'isScatterer', False):
         omega = em.aerosol_albedo
         w_J = omega if em.aerosol_scattering else 0.0
