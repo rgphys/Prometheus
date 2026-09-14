@@ -300,7 +300,11 @@ class CIAConstituent:
         coarse = np.geomspace(lo, hi, n_c)
         tab = self._gridFor(coarse)
         idx = np.clip(np.searchsorted(coarse, wavelength) - 1, 0, n_c - 2)
-        u = np.clip((wavelength - coarse[idx]) / (coarse[idx + 1] - coarse[idx]), 0.0, 1.0)
+        # A single-wavelength (or constant) grid gives coincident coarse nodes;
+        # the weight is then irrelevant, so avoid 0/0.
+        span = coarse[idx + 1] - coarse[idx]
+        safe = np.where(span > 0, span, 1.0)
+        u = np.where(span > 0, np.clip((wavelength - coarse[idx]) / safe, 0.0, 1.0), 0.0)
         val = (np.ascontiguousarray(tab), idx.astype(np.int64), u)
         self._coarse_cache = (key, val)
         return val

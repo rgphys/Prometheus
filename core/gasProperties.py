@@ -1971,6 +1971,10 @@ def _load_optical_constants(path: str, oc_format: str = 'auto'):
     return wl[idx], n[idx], np.clip(k[idx], 0.0, None)
 
 
+# Half-width of the Mie size quadrature, in log-normal widths.
+MIE_WIDTHS = 5.0
+
+
 class MieAerosol(ScatteringConstituent):
     """Aerosol extinction from Mie theory + real published optical constants.
 
@@ -2001,7 +2005,7 @@ class MieAerosol(ScatteringConstituent):
     """
 
     def __init__(self, chi: float = 1.0, optical_constants: str = '',
-                 r_eff: float = 0.1, sigma_g: float = 1.6, n_radii: int = 40,
+                 r_eff: float = 0.1, sigma_g: float = 1.6, n_radii: int = 60,
                  oc_format: str = 'auto', P_top: Union[float, None] = None,
                  scale_height_factor: float = 1.0):
         """Initializes the MieAerosol.
@@ -2012,7 +2016,8 @@ class MieAerosol(ScatteringConstituent):
                 (see :func:`_load_optical_constants` for supported formats).
             r_eff (float): Geometric-median grain radius [um]. Defaults to 0.1.
             sigma_g (float): Geometric width of the log-normal. Defaults to 1.6.
-            n_radii (int): Radius quadrature points. Defaults to 40.
+            n_radii (int): Radius quadrature points over +-MIE_WIDTHS widths.
+                Defaults to 60 (<0.2% quadrature error for r_eff <= 1 um in the IR).
             oc_format (str): Optical-constant file format hint. Defaults 'auto'.
             P_top (Optional[float]): Cloud-top pressure [barye]. Defaults to None.
             scale_height_factor (float): Aerosol-to-gas scale-height ratio
@@ -2041,9 +2046,14 @@ class MieAerosol(ScatteringConstituent):
         k_lam = np.clip(np.interp(lam_um, self._wl_um, self._k), 0.0, None)
         m = n_lam - 1j * k_lam
         ln_sg = np.log(self.sigma_g)
-        radii = np.geomspace(self.r_eff / self.sigma_g ** 3,
-                             self.r_eff * self.sigma_g ** 3, self.n_radii)
-        w = np.exp(-0.5 * (np.log(radii / self.r_eff) / ln_sg) ** 2) / radii
+        # Radii are spaced uniformly in ln r, so the quadrature weight is the
+        # log-normal density in ln r itself -- no 1/r Jacobian (that factor
+        # belongs to dN/dr and would shift the realised median to
+        # r_eff * exp(-ln^2 sigma_g)).  +-MIE_WIDTHS widths keep the r^2- and
+        # r^3-weighted tails that dominate the cross-section.
+        radii = np.geomspace(self.r_eff / self.sigma_g ** MIE_WIDTHS,
+                             self.r_eff * self.sigma_g ** MIE_WIDTHS, self.n_radii)
+        w = np.exp(-0.5 * (np.log(radii / self.r_eff) / ln_sg) ** 2)
         w /= w.sum()
         sig_um2 = np.zeros_like(lam_um)
         for r, wr in zip(radii, w):
@@ -2756,7 +2766,8 @@ class WavelengthGrid:
         linesList: List[float] = []
         for densityDistribution in densityDistributionList:
             for constituent in densityDistribution.constituents:
-                if constituent.isMolecule or getattr(constituent, 'isScatterer', False):
+                if (constituent.isMolecule or getattr(constituent, 'isScatterer', False)
+                        or getattr(constituent, 'isContinuum', False)):
                     continue
                 lines_w = constituent.getLineParameters(
                     np.array([self.lower_w, self.upper_w]))[0]
@@ -2819,7 +2830,7 @@ class Transit:
             if densityDistribution.hasMoon:
                 moon = densityDistribution.moon
                 y_moon = moon.getPosition(orbphase)[1]
-                blockingMoon = ((y - y_moon)**2 + z**2 < moon.R)
+                blockingMoon = ((y - y_moon)**2 + z**2 < moon.R**2)
                 if blockingMoon:
                     return True
         return False
